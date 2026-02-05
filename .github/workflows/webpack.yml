@@ -2,10 +2,8 @@ name: Deploy Vite App to GitHub Pages
 
 on:
   push:
-    branches: [ "master" ]          # 你的默认分支是 master（从截图看）
-  pull_request:
     branches: [ "master" ]
-  workflow_dispatch:                # 允许手动触发（强烈推荐调试用）
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -38,8 +36,8 @@ jobs:
           VITE_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
 
-      - name: Debug: Show dist contents
-        run: ls -la dist || echo "dist directory not found!"
+      - name: Debug dist
+        run: ls -la dist || echo "dist not found"
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
