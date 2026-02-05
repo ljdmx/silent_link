@@ -314,16 +314,16 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         { urls: 'stun:stun.cloudflare.com:3478' },
         // Placeholder for TURN server to achieve 100% connectivity in restrictive networks
         // Users can replace these with their own Coturn or paid TURN service credentials
-        {
-          urls: 'turn:openrelay.metered.ca:80',
-          username: 'openrelayproject',
-          credential: 'openrelayproject'
-        },
-        {
-          urls: 'turn:openrelay.metered.ca:443',
-          username: 'openrelayproject',
-          credential: 'openrelayproject'
-        }
+        // {
+        //   urls: 'turn:openrelay.metered.ca:80',
+        //   username: 'openrelayproject',
+        //   credential: 'openrelayproject'
+        // },
+        // {
+        //   urls: 'turn:openrelay.metered.ca:443',
+        //   username: 'openrelayproject',
+        //   credential: 'openrelayproject'
+        // }
       ],
       iceCandidatePoolSize: 5
     });
