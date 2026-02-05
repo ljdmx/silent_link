@@ -1,73 +1,61 @@
-# .github/workflows/deploy-pages.yml
-
-name: Deploy to GitHub Pages
+name: Deploy Vite App to GitHub Pages
 
 on:
-  # 推送到 main 分支时触发（可改成你的默认分支）
   push:
-    branches: ["main"]
+    branches: [ "master" ]          # 你的默认分支是 master（从截图看）
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:                # 允许手动触发（强烈推荐调试用）
 
-  # 允许手动触发（Actions 页面点 Run workflow）
-  workflow_dispatch:
-
-# 声明 GITHUB_TOKEN 需要的权限（必须的）
 permissions:
-  contents: read          # 允许 checkout 代码
-  pages: write            # 允许写入 Pages 部署
-  id-token: write         # 允许生成 OIDC token（deploy-pages 必须）
+  contents: read
+  pages: write
+  id-token: write
 
-# 防止多个部署同时跑（取消进行中的旧部署）
 concurrency:
   group: "pages"
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'          # 缓存 node_modules，提升速度
+          cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci             # 干净安装，推荐用于 CI
+        run: npm ci
 
       - name: Build
         run: npm run build
         env:
           VITE_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-          # 如果你有其他 Vite 环境变量，也加在这里
 
-      - name: Verify build output (debug)
-        run: |
-          ls -la dist || echo "dist not found!"
-          head -n 20 dist/index.html || echo "index.html not found!"
+      - name: Debug: Show dist contents
+        run: ls -la dist || echo "dist directory not found!"
 
       - name: Setup Pages
-        uses: actions/configure-pages@v5   # 推荐添加，设置 Pages 环境
+        uses: actions/configure-pages@v5
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: dist                        # Vite 默认输出目录
+          path: dist
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
-
-    # 环境声明（可选，但推荐）
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-
     steps:
-      - name: Deploy to GitHub Pages
+      - name: Deploy
         id: deployment
         uses: actions/deploy-pages@v4
