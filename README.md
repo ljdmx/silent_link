@@ -1,6 +1,5 @@
 # SilentLink | 主权级隐私通讯协议 (Sovereign Tier)
 
-![SilentLink Hero](/silentlink_hero.png)
 
 SilentLink 是一款专为极致主权设计的点对点（P2P）通信协议实现。基于 **WebRTC 原始隧道** 与 **AES-256-GCM 硬件加解密**，我们为您构建了一个绝对的“数字孤岛”。
 
