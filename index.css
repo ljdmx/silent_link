@@ -2,114 +2,159 @@
 
 @theme {
     /* Color Sovereignty: OKLCH Precision */
-    --color-primary: oklch(65% 0.2 250);
-    --color-primary-dim: oklch(65% 0.2 250 / 0.15);
-    --color-accent: oklch(75% 0.18 150);
-    --color-background: oklch(15% 0.02 240);
-    --color-surface: oklch(20% 0.03 240);
-    --color-card: oklch(22% 0.03 240);
-    --color-border: oklch(100% 0 0 / 0.08);
+    --color-primary: oklch(65% 0.25 255);
+    --color-primary-dim: oklch(65% 0.25 255 / 0.15);
+    --color-accent: oklch(75% 0.22 155);
+    --color-background: oklch(12% 0.025 250);
+    --color-surface: oklch(18% 0.035 250);
+    --color-card: oklch(20% 0.04 250);
+    --color-border: oklch(100% 0 0 / 0.06);
 
-    /* Phi-based Spacing Scale (Geometric Harmony) */
+    /* Security Palette */
+    --color-security-low: oklch(60% 0.2 25);
+    --color-security-mid: oklch(70% 0.18 85);
+    --color-security-high: oklch(75% 0.2 145);
+
+    /* Fluid Typography Scale (Base 16px) */
+    --text-xs: clamp(0.65rem, 0.6rem + 0.25vw, 0.75rem);
+    --text-sm: clamp(0.75rem, 0.7rem + 0.3vw, 0.875rem);
+    --text-base: clamp(0.9rem, 0.85rem + 0.4vw, 1rem);
+    --text-lg: clamp(1rem, 0.95rem + 0.5vw, 1.125rem);
+    --text-xl: clamp(1.125rem, 1.05rem + 0.6vw, 1.25rem);
+    --text-2xl: clamp(1.35rem, 1.25rem + 0.8vw, 1.5rem);
+    --text-3xl: clamp(1.75rem, 1.6rem + 1.2vw, 2.25rem);
+    --text-4xl: clamp(2.25rem, 2rem + 2vw, 3.5rem);
+
+    /* Phi-based Spacing */
     --spacing-phi-xs: 0.382rem;
     --spacing-phi-sm: 0.618rem;
     --spacing-phi-md: 1rem;
     --spacing-phi-lg: 1.618rem;
     --spacing-phi-xl: 2.618rem;
-    --spacing-phi-2xl: 4.236rem;
-    --spacing-phi-3xl: 6.854rem;
 
-    /* Sentient Kinetics: Predictive Velocity */
-    --animate-sentient-in: sentient-in 0.6s cubic-bezier(0.16, 1, 0.3, 1);
-    --animate-sentient-out: sentient-out 0.4s cubic-bezier(0.7, 0, 0.84, 0);
-    --animate-float: float 6s cubic-bezier(0.45, 0.05, 0.55, 0.95) infinite;
+    /* Animations */
+    --animate-mesh: mesh 15s ease-in-out infinite alternate;
+    --animate-sentient-in: sentient-in 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+    --animate-pulse-glow: pulse-glow 4s infinite alternate;
+    --animate-scanline: scanline 12s linear infinite;
 
-    --font-sans: "Inter", "Noto Sans SC", system-ui;
-    --font-mono: "JetBrains Mono", monospace;
+    --font-sans: "Outfit", "Inter", "Noto Sans SC", system-ui;
+    --font-mono: "JetBrains Mono", "Cascadia Code", monospace;
 }
 
 @layer base {
     :root {
         --bg-color: var(--color-background);
-        --primary-glow: var(--color-primary-dim);
     }
 
     body {
         background-color: var(--bg-color);
-        color: oklch(98% 0.01 240);
+        color: oklch(99% 0.005 250);
         overflow-x: hidden;
         font-family: var(--font-sans);
         -webkit-font-smoothing: antialiased;
-        line-height: 1.618;
-        /* Phi-based leading */
+        line-height: 1.4;
+        letter-spacing: -0.015em;
     }
 
-    /* Surgical Noise Overlay */
+    /* Mesh Gradient Synthesis */
     body::before {
         content: "";
         position: fixed;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
-        opacity: 0.03;
+        inset: 0;
+        background:
+            radial-gradient(at 0% 0%, oklch(65% 0.3 260 / 0.15) 0px, transparent 50%),
+            radial-gradient(at 100% 0%, oklch(75% 0.25 160 / 0.1) 0px, transparent 50%),
+            radial-gradient(at 100% 100%, oklch(60% 0.3 25 / 0.08) 0px, transparent 50%),
+            radial-gradient(at 0% 100%, oklch(65% 0.3 260 / 0.12) 0px, transparent 50%);
+        filter: blur(80px);
+        animation: mesh 20s ease-in-out infinite alternate;
         pointer-events: none;
-        z-index: 9999;
+        z-index: -1;
+    }
+
+    /* Noise Texture Overlay */
+    body::after {
+        content: "";
+        position: fixed;
+        inset: 0;
+        background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
+        opacity: 0.035;
+        pointer-events: none;
+        z-index: 50;
     }
 }
 
 @layer components {
-    .glass {
-        @apply bg-surface/60 backdrop-blur-[32px] saturate-[150%] border border-border;
-        box-shadow: 0 8px 32px 0 oklch(0% 0 0 / 0.3);
+    .surgical-card {
+        @apply relative overflow-hidden rounded-[1.5rem] md:rounded-[2.5rem] bg-card/45 backdrop-blur-[48px] border border-white/10 transition-all duration-700;
+        box-shadow:
+            0 30px 60px -12px oklch(0% 0 0 / 0.6),
+            inset 0 1px 1px oklch(100% 0 0 / 0.1);
     }
 
-    .surgical-card {
-        @apply relative overflow-hidden rounded-[2.618rem] bg-card border border-border shadow-2xl transition-all duration-500 hover:shadow-primary/5 hover:border-primary/20;
+    .surgical-card::after {
+        content: "";
+        @apply absolute inset-0 bg-gradient-to-br from-primary/10 via-transparent to-accent/10 opacity-30 pointer-events-none;
+    }
+
+    .premium-input {
+        @apply w-full h-12 md:h-14 bg-white/[0.04] border border-white/[0.08] rounded-xl px-4 md:px-5 focus:border-primary/60 focus:bg-white/[0.08] outline-none transition-all duration-500 placeholder:text-white/20 text-white font-medium;
+        box-shadow: inset 0 2px 4px oklch(0% 0 0 / 0.15);
     }
 }
 
-@keyframes float {
-
-    0%,
-    100% {
-        transform: translateY(0px);
+@keyframes mesh {
+    0% {
+        background-position: 0% 0%;
     }
 
     50% {
-        transform: translateY(-1.618rem);
+        background-position: 100% 100%;
+    }
+
+    100% {
+        background-position: 0% 100%;
     }
 }
 
 @keyframes sentient-in {
-    0% {
-        transform: scale(0.95) translateY(1.618rem);
+    from {
+        transform: translateY(30px) scale(0.97);
         opacity: 0;
     }
 
-    100% {
-        transform: scale(1) translateY(0);
+    to {
+        transform: translateY(0) scale(1);
         opacity: 1;
     }
 }
 
-@keyframes sentient-out {
+@keyframes pulse-glow {
     0% {
-        transform: scale(1) translateY(0);
-        opacity: 1;
+        filter: blur(100px) opacity(0.3);
+        transform: scale(1);
     }
 
     100% {
-        transform: scale(0.95) translateY(-1.618rem);
-        opacity: 0;
+        filter: blur(120px) opacity(0.5);
+        transform: scale(1.1);
     }
 }
 
-/* Precise Scrollbar */
+@keyframes scanline {
+    0% {
+        transform: translateY(-100%);
+    }
+
+    100% {
+        transform: translateY(100%);
+    }
+}
+
+/* Scrollbar Synthetics */
 ::-webkit-scrollbar {
-    width: 0.382rem;
-    height: 0.382rem;
+    width: 4px;
 }
 
 ::-webkit-scrollbar-track {
@@ -117,9 +162,8 @@
 }
 
 ::-webkit-scrollbar-thumb {
-    background: oklch(100% 0 0 / 0.1);
-    border-radius: 1rem;
-    border: 1px solid oklch(100% 0 0 / 0.05);
+    background: oklch(100% 0 0 / 0.15);
+    border-radius: 20px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
