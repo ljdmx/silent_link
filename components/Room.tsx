@@ -1,25 +1,29 @@
-
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { RoomConfig, Participant, PrivacyFilter, ChatMessage, FileTransfer, ReceivingFileState, FileMetaPayload } from '../types';
 import { deriveKey, encryptMessage, decryptMessage, encryptBuffer, decryptBuffer, hashPassphrase } from '../crypto';
 import { supabase } from '../supabase';
 import VideoCard from './VideoCard';
 
-// Protocol Constants
+// Protocol Constants - 优化移动端性能
 const PROTOCOL_CONFIG = {
   CHUNK_SIZE: 64 * 1024,
   BUFFER_THRESHOLD: 1 * 1024 * 1024,
-  HEARTBEAT_INTERVAL: 5000,
-  HANDSHAKE_TIMEOUT: 4000,
-  GATHERING_TIMEOUT: 4000,
+  HEARTBEAT_INTERVAL: 8000,
+  HANDSHAKE_TIMEOUT: 5000, // 增加超时时间，适应移动网络
+  GATHERING_TIMEOUT: 5000, // 增加 ICE 收集超时
   SESSION_EXPIRY: 8000,
   ROOM_FULL_EXPIRY: 12000,
-  MOBILE_WIDTH: 640,
-  MOBILE_HEIGHT: 360,
-  DESKTOP_WIDTH: 1280,
-  DESKTOP_HEIGHT: 720,
-  MAX_FILE_SIZE: 100 * 1024 * 1024, // 100MB
-  NEGOTIATION_THROTTLE: 5000
+  // 移动端分辨率优化 - 降低以提升流畅度
+  MOBILE_WIDTH: 320,
+  MOBILE_HEIGHT: 240,
+  DESKTOP_WIDTH: 640, // 降至 360p 以确保稳定性
+  DESKTOP_HEIGHT: 480,
+  MAX_FILE_SIZE: 100 * 1024 * 1024,
+  NEGOTIATION_THROTTLE: 5000,
+  TARGET_FRAMERATE: 15, // 降低帧率以提升移动端稳定性
+  MAX_BITRATE_KBPS: 800, // 降低码率适应移动网络
+  ICE_RESTART_DELAY: 3000, // ICE 重启延迟
+  MOBILE_BITRATE_KBPS: 500, // 移动端专用低码率
 };
 
 type SignalingPayload = {
@@ -80,14 +84,23 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const isSignalingRef = useRef(false);
   const roleRef = useRef<HandshakeRole>(config.initialOffer ? 'receiver' : 'none');
   const connectionStatusRef = useRef<'idle' | 'preparing' | 'ready' | 'connected' | 'security-error' | 'media-error' | 'room-full'>('idle');
-  const processedOfferRef = useRef(false);
-  const processedAnswerRef = useRef(false);
+  const processedOfferRef = useRef<string | null>(null); // 改用 SDP 内容作为标识
+  const processedAnswerRef = useRef<string | null>(null);
   const signalChannelRef = useRef<any>(null);
 
   // Managed Resources
   const timeoutsRef = useRef<Set<any>>(new Set());
   const intervalsRef = useRef<Set<any>>(new Set());
   const remoteStreamRef = useRef<MediaStream | null>(null);
+
+  // 新增：检测是否为移动设备
+  const isMobileDevice = useRef(
+    /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) ||
+    ('ontouchstart' in window && navigator.maxTouchPoints > 0)
+  );
+
+  // 新增：ICE 连接状态跟踪
+  const iceConnectionStateRef = useRef<RTCIceConnectionState>('new');
 
   const addTimeout = useCallback((fn: () => void, ms: number) => {
     const t = setTimeout(() => { timeoutsRef.current.delete(t); fn(); }, ms);
@@ -127,7 +140,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   }, []);
 
   const scheduleReconnect = useCallback((delayMs = 1000) => {
-    if (reconnectTimeoutRef.current) return; // Already scheduled
+    if (reconnectTimeoutRef.current) return;
     reconnectTimeoutRef.current = setTimeout(() => {
       reconnectTimeoutRef.current = null;
       joinAndSignalRef.current?.();
@@ -136,10 +149,8 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
 
   const cleanupResources = useCallback(() => {
     try {
-      // Clear file receive state
       receivingRef.current = null;
 
-      // Close peers with event handler cleanup
       peersRef.current.forEach(pc => {
         pc.ontrack = null;
         pc.onicecandidate = null;
@@ -147,11 +158,11 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         pc.onnegotiationneeded = null;
         pc.onicecandidateerror = null;
         pc.onicegatheringstatechange = null;
+        pc.oniceconnectionstatechange = null; // 新增
         pc.close();
       });
       peersRef.current.clear();
 
-      // Close data channels with event handler cleanup
       dataChannelsRef.current.forEach(dc => {
         dc.onmessage = null;
         dc.onclose = null;
@@ -160,40 +171,34 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       });
       dataChannelsRef.current.clear();
 
-      // Stop media tracks
       rawStreamRef.current?.getTracks().forEach(t => t.stop());
       processedStreamRef.current?.getTracks().forEach(t => t.stop());
       remoteStreamRef.current = null;
 
-      // Revoke blob URLs
       blobUrlsRef.current.forEach(url => URL.revokeObjectURL(url));
       blobUrlsRef.current.clear();
 
-      // Clear all timers
       clearAllTimers();
 
-      // Remove signaling channel
       if (signalChannelRef.current) {
         supabase.removeChannel(signalChannelRef.current);
         signalChannelRef.current = null;
       }
 
-      // Cancel pending reconnect
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
         reconnectTimeoutRef.current = null;
       }
 
-      // Abort active file transfer
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
         abortControllerRef.current = null;
       }
 
-      // Reset signaling state
       isSignalingRef.current = false;
-      processedOfferRef.current = false;
-      processedAnswerRef.current = false;
+      processedOfferRef.current = null;
+      processedAnswerRef.current = null;
+      iceConnectionStateRef.current = 'new';
     } catch (e) {
       console.error("Cleanup error:", e);
     }
@@ -211,8 +216,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     setParticipants(prev => {
       const exists = prev.find(u => u.id === p.id);
       if (exists) {
-        // Stream and other complex objects won't stringify well, 
-        // focus on name, enabling flags, and stream presence change
         const changed = exists.name !== p.name ||
           exists.audioEnabled !== p.audioEnabled ||
           exists.videoEnabled !== p.videoEnabled ||
@@ -224,7 +227,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     });
   }, []);
 
-  // Audio Mute Control (inline send to avoid dependency loop)
   useEffect(() => {
     isMutedRef.current = isMuted;
     rawStreamRef.current?.getAudioTracks().forEach(track => { track.enabled = !isMuted; });
@@ -240,14 +242,12 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     }
   }, [isMuted]);
 
-  // Remote Stream Tracking
   useEffect(() => {
     if (remoteParticipant?.stream && remoteParticipant.stream !== remoteStreamRef.current) {
       remoteStreamRef.current = remoteParticipant.stream;
     }
   }, [remoteParticipant]);
 
-  // Remote Audio Mute Control
   useEffect(() => {
     if (remoteStreamRef.current) {
       remoteStreamRef.current.getAudioTracks().forEach(track => { track.enabled = !isRemoteMuted; });
@@ -305,61 +305,170 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const setupPeerConnection = useCallback(async (remoteId: string, isOffer: boolean): Promise<RTCPeerConnection> => {
     const pc = new RTCPeerConnection({
       iceServers: [
-        { urls: 'stun:stun.qq.com:3478' },
-        { urls: 'stun:stun.miwifi.com:3478' },
-        { urls: 'stun:stun.douyucdn.cn:3478' },
-        { urls: 'stun:stun.hitv.com:3478' },
-        { urls: 'stun:stun.syncthing.net:3478' },
+        // 移动端优化：优先使用稳定的 STUN 服务器
         { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
         { urls: 'stun:stun.cloudflare.com:3478' },
-        // Placeholder for TURN server to achieve 100% connectivity in restrictive networks
-        // Users can replace these with their own Coturn or paid TURN service credentials
-        // {
-        //   urls: 'turn:openrelay.metered.ca:80',
-        //   username: 'openrelayproject',
-        //   credential: 'openrelayproject'
-        // },
-        // {
-        //   urls: 'turn:openrelay.metered.ca:443',
-        //   username: 'openrelayproject',
-        //   credential: 'openrelayproject'
-        // }
+        { urls: 'stun:stun.qq.com:3478' },
       ],
-      iceCandidatePoolSize: 5
+      iceCandidatePoolSize: 0, // 移动端设为 0，减少资源消耗
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require',
+      // 移动端优化：启用持续收集
+      iceTransportPolicy: 'all',
     });
     peersRef.current.set(remoteId, pc);
+
+    // ICE 候选处理 - 完整日志
     pc.onicecandidate = (e) => {
       if (e.candidate) {
-        console.log(`Signaling: [ICE] Type: ${e.candidate.type} | Proto: ${e.candidate.protocol} | Port: ${e.candidate.port}`);
-        if (e.candidate.type === 'relay') console.log("Signaling: [Sovereign Mode] Using TURN Relay for 100% penetration.");
+        console.log(`[ICE] Candidate: ${e.candidate.type} | ${e.candidate.protocol} | ${e.candidate.address || 'N/A'}`);
+      } else {
+        console.log('[ICE] All candidates gathered');
       }
     };
-    if (processedStreamRef.current) processedStreamRef.current.getTracks().forEach(t => pc.addTrack(t, processedStreamRef.current!));
-    pc.ontrack = (e) => addOrUpdateParticipant({ id: remoteId, name: "远端节点", isLocal: false, isHost: false, audioEnabled: true, videoEnabled: true, stream: e.streams[0] });
+
+    // 添加媒体轨道并设置码率限制
+    if (processedStreamRef.current) {
+      processedStreamRef.current.getTracks().forEach(t => {
+        const sender = pc.addTrack(t, processedStreamRef.current!);
+
+        // 根据设备类型设置码率
+        if (t.kind === 'video') {
+          setTimeout(async () => {
+            try {
+              const params = sender.getParameters();
+              if (!params.encodings) params.encodings = [{}];
+
+              const maxBitrate = isMobileDevice.current
+                ? PROTOCOL_CONFIG.MOBILE_BITRATE_KBPS * 1000
+                : PROTOCOL_CONFIG.MAX_BITRATE_KBPS * 1000;
+
+              params.encodings[0].maxBitrate = maxBitrate;
+              // 移动端额外优化
+              if (isMobileDevice.current) {
+                params.encodings[0].scaleResolutionDownBy = 1.5; // 降低分辨率
+                params.encodings[0].maxFramerate = PROTOCOL_CONFIG.TARGET_FRAMERATE;
+              }
+
+              await sender.setParameters(params);
+              console.log(`[Bitrate] Set to ${maxBitrate / 1000}kbps (Mobile: ${isMobileDevice.current})`);
+            } catch (e) {
+              console.warn("Bitrate limiting failed:", e);
+            }
+          }, 100);
+        }
+      });
+    }
+
+    pc.ontrack = (e) => {
+      console.log('[Track] Remote track received:', e.track.kind);
+      addOrUpdateParticipant({
+        id: remoteId,
+        name: "远端节点",
+        isLocal: false,
+        isHost: false,
+        audioEnabled: true,
+        videoEnabled: true,
+        stream: e.streams[0]
+      });
+    };
+
+    // 连接状态监控 - 增强版
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'connected') { updateStatus('connected'); syncPrivacy(filterRef.current, isMutedRef.current); }
-      if (pc.connectionState === 'closed' || pc.connectionState === 'failed') {
-        showToast("主权隧道掉线，尝试极速自愈...", "warning");
-        scheduleReconnect(1000);
+      console.log('[Connection] State:', pc.connectionState);
+
+      if (pc.connectionState === 'connected') {
+        updateStatus('connected');
+        syncPrivacy(filterRef.current, isMutedRef.current);
+        showToast("端对端隧道已建立", "info");
+        heartbeatFailuresRef.current = 0;
+      }
+
+      if (pc.connectionState === 'disconnected') {
+        showToast("连接暂时中断，尝试恢复...", "warning");
+      }
+
+      if (pc.connectionState === 'failed') {
+        console.error('[Connection] Failed, attempting ICE restart');
+        showToast("连接失败，正在重新协商...", "error");
+        scheduleReconnect(PROTOCOL_CONFIG.ICE_RESTART_DELAY);
+      }
+
+      if (pc.connectionState === 'closed') {
+        console.log('[Connection] Closed');
       }
     };
-    pc.onicecandidateerror = (e) => { if (e.errorCode >= 300) console.warn("ICE Component Error:", e.url, e.errorText); };
+
+    // ICE 连接状态监控 - 新增
+    pc.oniceconnectionstatechange = () => {
+      const prevState = iceConnectionStateRef.current;
+      iceConnectionStateRef.current = pc.iceConnectionState;
+
+      console.log(`[ICE Connection] ${prevState} → ${pc.iceConnectionState}`);
+
+      if (pc.iceConnectionState === 'failed') {
+        console.error('[ICE] Connection failed, attempting restart');
+        // ICE 重启
+        if (pc.connectionState !== 'closed') {
+          pc.restartIce();
+          showToast("网络切换，正在重新建立连接...", "warning");
+        }
+      }
+
+      if (pc.iceConnectionState === 'disconnected') {
+        console.warn('[ICE] Disconnected, waiting for recovery...');
+        // 给予一定时间自动恢复
+        addTimeout(() => {
+          if (pc.iceConnectionState === 'disconnected') {
+            console.log('[ICE] Still disconnected, triggering reconnect');
+            scheduleReconnect(2000);
+          }
+        }, 5000);
+      }
+
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        console.log('[ICE] Connection established successfully');
+      }
+    };
+
+    pc.onicecandidateerror = (e) => {
+      if (e.errorCode >= 300) {
+        console.warn(`[ICE Error] Code ${e.errorCode}: ${e.errorText} (${e.url})`);
+      }
+    };
+
     pc.onnegotiationneeded = async () => {
       const now = Date.now();
-      if (pc.signalingState === 'stable' && roleRef.current === 'initiator' && now - lastNegotiationRef.current > PROTOCOL_CONFIG.NEGOTIATION_THROTTLE) {
+      if (pc.signalingState === 'stable' &&
+        roleRef.current === 'initiator' &&
+        now - lastNegotiationRef.current > PROTOCOL_CONFIG.NEGOTIATION_THROTTLE) {
         lastNegotiationRef.current = now;
+        console.log('[Negotiation] Needed, triggering rejoin');
         joinAndSignalRef.current?.();
       }
     };
 
-    if (isOffer) { const dc = pc.createDataChannel('chat', { ordered: true }); setupDC(remoteId, dc); }
-    else pc.ondatachannel = (e) => setupDC(remoteId, e.channel);
+    if (isOffer) {
+      const dc = pc.createDataChannel('chat', { ordered: true });
+      setupDC(remoteId, dc);
+    } else {
+      pc.ondatachannel = (e) => {
+        console.log('[DataChannel] Received');
+        setupDC(remoteId, e.channel);
+      };
+    }
+
     return pc;
-  }, [addOrUpdateParticipant, syncPrivacy, showToast, setupDC]);
+  }, [addOrUpdateParticipant, syncPrivacy, showToast, setupDC, updateStatus, scheduleReconnect, addTimeout]);
 
   const joinAndSignal = useCallback(async (retryCount = 0) => {
-    if (isSignalingRef.current || retryCount > 3) return;
+    if (isSignalingRef.current || retryCount > 3) {
+      console.log(`[Signaling] Blocked: inProgress=${isSignalingRef.current}, retries=${retryCount}`);
+      return;
+    }
     isSignalingRef.current = true;
+    console.log('[Signaling] Starting handshake...');
 
     if (heartbeatRef.current) {
       clearInterval(heartbeatRef.current);
@@ -370,36 +479,52 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     const room_id = config.roomId;
     const pass_hash = await hashPassphrase(config.passphrase);
     setParticipants(prev => prev.map(p => p.isLocal ? { ...p, id: peerId } : p));
-    processedOfferRef.current = false;
-    processedAnswerRef.current = false;
+    processedOfferRef.current = null;
+    processedAnswerRef.current = null;
 
-    const channel = supabase.channel(`room-${room_id}`).on('postgres_changes', { event: '*', schema: 'public', table: 'rooms_signaling', filter: `room_id=eq.${room_id}` }, async (payload) => {
+    const channel = supabase.channel(`room-${room_id}`).on('postgres_changes', {
+      event: '*',
+      schema: 'public',
+      table: 'rooms_signaling',
+      filter: `room_id=eq.${room_id}`
+    }, async (payload) => {
       if (payload.eventType === 'DELETE') {
+        console.log('[Signaling] Room deleted');
         if (connectionStatusRef.current !== 'connected') {
           cleanupResources();
           scheduleReconnect(500);
         }
         return;
       }
+
       if (payload.eventType === 'INSERT' && connectionStatusRef.current !== 'connected' && roleRef.current === 'none') {
+        console.log('[Signaling] New room detected, rescheduling');
         isSignalingRef.current = false;
         scheduleReconnect(300);
         return;
       }
+
       const updatedRoom = payload.new as SignalingPayload;
       if (!updatedRoom) return;
 
-      if (updatedRoom.offer && updatedRoom.offer !== 'CLAIMED' && roleRef.current === 'receiver' &&
-        (connectionStatusRef.current === 'preparing' || connectionStatusRef.current === 'idle') && !processedOfferRef.current) {
-        processedOfferRef.current = true;
-        console.log("Signaling: Handling Offer Update...");
+      // 处理 Offer - 使用 SDP 内容防重
+      if (updatedRoom.offer &&
+        updatedRoom.offer !== 'CLAIMED' &&
+        roleRef.current === 'receiver' &&
+        (connectionStatusRef.current === 'preparing' || connectionStatusRef.current === 'idle') &&
+        processedOfferRef.current !== updatedRoom.offer) {
+
+        processedOfferRef.current = updatedRoom.offer;
+        console.log("[Signaling] Processing new Offer (realtime)");
         updateStatus('preparing');
+
         const offer = JSON.parse(atob(updatedRoom.offer));
         const pc = await setupPeerConnection('peer', false);
         let gatheringComplete = false;
+
         const gatherTimeout = addTimeout(() => {
           if (!gatheringComplete && pc.localDescription) {
-            console.log("Signaling: Gathering timeout, sending Answer anyway");
+            console.log("[Signaling] Gathering timeout, sending Answer");
             sendAnswer(pc.localDescription);
           }
         }, PROTOCOL_CONFIG.GATHERING_TIMEOUT);
@@ -407,58 +532,84 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         const sendAnswer = async (description: RTCSessionDescriptionInit) => {
           if (gatheringComplete) return;
           gatheringComplete = true;
-          // Clear ICE gathering timeout
           clearTimeout(gatherTimeout);
           timeoutsRef.current.delete(gatherTimeout);
 
           const answerSDP = btoa(JSON.stringify(description));
-          console.log(`Signaling: Attempting to claim receiver slot as ${peerId}...`);
-          const { data: updData, error: updError } = await supabase.from('rooms_signaling').update({ receiver_id: peerId, answer: answerSDP }).eq('room_id', room_id).is('receiver_id', null).select();
+          console.log(`[Signaling] Claiming receiver slot as ${peerId}...`);
 
-          if (updError) console.error("Signaling: Receiver Update Error:", updError);
+          const { data: updData, error: updError } = await supabase
+            .from('rooms_signaling')
+            .update({ receiver_id: peerId, answer: answerSDP })
+            .eq('room_id', room_id)
+            .is('receiver_id', null)
+            .select();
 
           if (updError || !updData || updData.length === 0) {
-            console.warn("Signaling: Atomic claim failed, checking if already claimed by self...");
-            const { data: currentRoom } = await supabase.from('rooms_signaling').select('*').eq('room_id', room_id).single();
+            console.warn("[Signaling] Atomic claim failed, verifying...");
+            const { data: currentRoom } = await supabase
+              .from('rooms_signaling')
+              .select('*')
+              .eq('room_id', room_id)
+              .single();
+
             if (currentRoom && currentRoom.receiver_id === peerId) {
-              console.log("Signaling: Already claimed by self, proceeding.");
-              localSDPRef.current = answerSDP; updateStatus('ready');
+              console.log("[Signaling] Already claimed by self");
+              localSDPRef.current = answerSDP;
+              updateStatus('ready');
             } else {
-              console.error("Signaling: Room full or claimed by others. Current receiver:", currentRoom?.receiver_id);
+              console.error("[Signaling] Room full, receiver:", currentRoom?.receiver_id);
               updateStatus('room-full');
             }
           } else {
-            console.log("Signaling: Receiver slot claimed successfully.");
-            localSDPRef.current = answerSDP; updateStatus('ready');
+            console.log("[Signaling] Receiver slot claimed successfully");
+            localSDPRef.current = answerSDP;
+            updateStatus('ready');
           }
           isSignalingRef.current = false;
         };
 
         pc.onicegatheringstatechange = () => {
-          console.log("Signaling: Receiver ICE Gathering State:", pc.iceGatheringState);
-          if (pc.iceGatheringState === 'complete' && !gatheringComplete) sendAnswer(pc.localDescription!);
+          console.log("[ICE Gathering] Receiver state:", pc.iceGatheringState);
+          if (pc.iceGatheringState === 'complete' && !gatheringComplete) {
+            sendAnswer(pc.localDescription!);
+          }
         };
+
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(offer));
-          const answer = await pc.createAnswer(); await pc.setLocalDescription(answer);
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          console.log("[Signaling] Answer created, waiting for ICE");
         } catch (err) {
-          console.error("Signaling: Receiver SDP Error:", err);
+          console.error("[Signaling] Receiver SDP Error:", err);
           isSignalingRef.current = false;
         }
         return;
       }
 
-      if (updatedRoom.answer && roleRef.current === 'initiator' && !processedAnswerRef.current) {
+      // 处理 Answer - 使用 SDP 内容防重
+      if (updatedRoom.answer &&
+        roleRef.current === 'initiator' &&
+        processedAnswerRef.current !== updatedRoom.answer) {
+
         const pc = peersRef.current.get('peer');
-        if (pc && (pc.signalingState === 'have-local-offer' || pc.signalingState === 'stable') && updatedRoom.initiator_id === peerId) {
+        if (pc &&
+          (pc.signalingState === 'have-local-offer' || pc.signalingState === 'stable') &&
+          updatedRoom.initiator_id === peerId) {
+
           try {
-            console.log("Signaling: Handling Answer Update...");
+            console.log("[Signaling] Processing Answer (realtime)");
             const answer = JSON.parse(atob(updatedRoom.answer));
+
             if (pc.signalingState === 'have-local-offer') {
-              processedAnswerRef.current = true;
+              processedAnswerRef.current = updatedRoom.answer;
               await pc.setRemoteDescription(new RTCSessionDescription(answer));
+              console.log("[Signaling] Remote description set successfully");
             }
-          } catch (e) { console.error("Signaling Answer Error:", e); }
+          } catch (e) {
+            console.error("[Signaling] Answer processing error:", e);
+          }
         }
       }
     });
@@ -466,7 +617,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     await new Promise<void>((resolve) => {
       channel.subscribe((status) => {
         if (status === 'SUBSCRIBED') {
-          console.log("Signaling: Realtime subscription ready");
+          console.log("[Signaling] Realtime subscription active");
           addTimeout(() => resolve(), 500);
         }
       });
@@ -474,22 +625,25 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     signalChannelRef.current = channel;
 
     try {
-      const { data: rooms } = await supabase.from('rooms_signaling').select('*').eq('room_id', room_id).limit(1);
+      const { data: rooms } = await supabase
+        .from('rooms_signaling')
+        .select('*')
+        .eq('room_id', room_id)
+        .limit(1);
+
       const roomData = rooms && rooms.length > 0 ? rooms[0] : null;
 
+      // 房间过期检查
       if (roomData && roomData.initiator_id && roomData.receiver_id) {
         const now = Date.now();
         if (roomData.updated_at) {
           const updatedAt = new Date(roomData.updated_at).getTime();
           if (!isNaN(updatedAt)) {
-            if (roomData.initiator_id === peerId || roomData.receiver_id === peerId) {
-              if (now - updatedAt > PROTOCOL_CONFIG.SESSION_EXPIRY) {
-                await supabase.from('rooms_signaling').delete().eq('room_id', room_id);
-                isSignalingRef.current = false;
-                addTimeout(() => joinAndSignal(0), 500);
-                return;
-              }
-            } else if (now - updatedAt > PROTOCOL_CONFIG.ROOM_FULL_EXPIRY) {
+            const isSelf = roomData.initiator_id === peerId || roomData.receiver_id === peerId;
+            const expiryTime = isSelf ? PROTOCOL_CONFIG.SESSION_EXPIRY : PROTOCOL_CONFIG.ROOM_FULL_EXPIRY;
+
+            if (now - updatedAt > expiryTime) {
+              console.log('[Signaling] Room expired, cleaning up');
               await supabase.from('rooms_signaling').delete().eq('room_id', room_id);
               isSignalingRef.current = false;
               addTimeout(() => joinAndSignal(0), 500);
@@ -497,95 +651,191 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
             }
           }
         }
+
         updateStatus('room-full');
         isSignalingRef.current = false;
         return;
       }
 
+      // Initiator 路径
       if (!roomData) {
-        console.log("Signaling: Claiming as Initiator...");
-        roleRef.current = 'initiator'; setRole('initiator'); updateStatus('preparing');
-        const { error: claimError } = await supabase.from('rooms_signaling').insert({ room_id, initiator_id: peerId, offer: 'CLAIMED', passphrase_hash: pass_hash });
+        console.log("[Signaling] No room found, claiming as Initiator");
+        roleRef.current = 'initiator';
+        setRole('initiator');
+        updateStatus('preparing');
+
+        const { error: claimError } = await supabase
+          .from('rooms_signaling')
+          .insert({
+            room_id,
+            initiator_id: peerId,
+            offer: 'CLAIMED',
+            passphrase_hash: pass_hash
+          });
+
         if (claimError) {
+          console.error('[Signaling] Claim failed:', claimError);
           isSignalingRef.current = false;
           addTimeout(() => joinAndSignal(retryCount + 1), 300);
           return;
         }
+
         const pc = await setupPeerConnection('peer', true);
         let gatheringComplete = false;
-        const gatherTimeout = addTimeout(() => { if (!gatheringComplete && pc.localDescription) sendOffer(pc.localDescription); }, PROTOCOL_CONFIG.GATHERING_TIMEOUT);
+
+        const gatherTimeout = addTimeout(() => {
+          if (!gatheringComplete && pc.localDescription) {
+            console.log('[Signaling] Initiator timeout, sending Offer');
+            sendOffer(pc.localDescription);
+          }
+        }, PROTOCOL_CONFIG.GATHERING_TIMEOUT);
+
         const sendOffer = async (description: RTCSessionDescriptionInit) => {
           if (gatheringComplete) return;
           gatheringComplete = true;
           clearTimeout(gatherTimeout);
           timeoutsRef.current.delete(gatherTimeout);
-          const offerSDP = btoa(JSON.stringify(description));
-          console.log("Signaling: Posting Offer...");
-          await supabase.from('rooms_signaling').update({ offer: offerSDP }).eq('room_id', room_id);
-          localSDPRef.current = offerSDP; updateStatus('ready'); isSignalingRef.current = false;
-        };
-        pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete' && !gatheringComplete) sendOffer(pc.localDescription!); };
-        const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
-      } else if (!roomData.receiver_id) {
-        if (roomData.passphrase_hash !== pass_hash) {
-          showToast("房间口令不匹配", "error"); isSignalingRef.current = false; addTimeout(onExit, 2000); return;
-        }
-        roleRef.current = 'receiver'; setRole('receiver'); updateStatus('preparing');
-        if (roomData.offer === 'CLAIMED') { isSignalingRef.current = false; return; }
 
-        processedOfferRef.current = true;
+          const offerSDP = btoa(JSON.stringify(description));
+          console.log("[Signaling] Posting Offer to DB");
+
+          await supabase
+            .from('rooms_signaling')
+            .update({ offer: offerSDP })
+            .eq('room_id', room_id);
+
+          localSDPRef.current = offerSDP;
+          processedOfferRef.current = offerSDP; // 标记已处理
+          updateStatus('ready');
+          isSignalingRef.current = false;
+        };
+
+        pc.onicegatheringstatechange = () => {
+          console.log('[ICE Gathering] Initiator state:', pc.iceGatheringState);
+          if (pc.iceGatheringState === 'complete' && !gatheringComplete) {
+            sendOffer(pc.localDescription!);
+          }
+        };
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        console.log('[Signaling] Offer created, waiting for ICE');
+      }
+      // Receiver 路径
+      else if (!roomData.receiver_id) {
+        if (roomData.passphrase_hash !== pass_hash) {
+          showToast("房间口令不匹配", "error");
+          isSignalingRef.current = false;
+          addTimeout(onExit, 2000);
+          return;
+        }
+
+        roleRef.current = 'receiver';
+        setRole('receiver');
+        updateStatus('preparing');
+
+        if (roomData.offer === 'CLAIMED') {
+          console.log('[Signaling] Offer not ready, waiting for realtime');
+          isSignalingRef.current = false;
+          return;
+        }
+
+        processedOfferRef.current = roomData.offer;
         const offer = JSON.parse(atob(roomData.offer));
-        console.log("Signaling: Found Offer in Fetch, processing...");
+        console.log("[Signaling] Found Offer in fetch, processing...");
+
         const pc = await setupPeerConnection('peer', false);
         let gatheringComplete = false;
-        const gatherTimeout = addTimeout(() => { if (!gatheringComplete && pc.localDescription) sendAnswer(pc.localDescription); }, PROTOCOL_CONFIG.GATHERING_TIMEOUT);
+
+        const gatherTimeout = addTimeout(() => {
+          if (!gatheringComplete && pc.localDescription) {
+            sendAnswer(pc.localDescription);
+          }
+        }, PROTOCOL_CONFIG.GATHERING_TIMEOUT);
+
         const sendAnswer = async (description: RTCSessionDescriptionInit) => {
           if (gatheringComplete) return;
           gatheringComplete = true;
           clearTimeout(gatherTimeout);
           timeoutsRef.current.delete(gatherTimeout);
+
           const answerSDP = btoa(JSON.stringify(description));
-          console.log(`Signaling: Attempting to claim receiver slot as ${peerId}...`);
-          const { data: updData, error: updError } = await supabase.from('rooms_signaling').update({ receiver_id: peerId, answer: answerSDP }).eq('room_id', room_id).is('receiver_id', null).select();
+          console.log(`[Signaling] Claiming receiver slot as ${peerId}`);
+
+          const { data: updData, error: updError } = await supabase
+            .from('rooms_signaling')
+            .update({ receiver_id: peerId, answer: answerSDP })
+            .eq('room_id', room_id)
+            .is('receiver_id', null)
+            .select();
+
           if (updError || !updData || updData.length === 0) {
-            const { data: currentRoom } = (await supabase.from('rooms_signaling').select('*').eq('room_id', room_id).single()) as { data: SignalingPayload };
+            const { data: currentRoom } = await supabase
+              .from('rooms_signaling')
+              .select('*')
+              .eq('room_id', room_id)
+              .single();
+
             if (currentRoom && currentRoom.receiver_id === peerId) {
-              console.log("Signaling: Already claimed by self, proceeding.");
-              localSDPRef.current = answerSDP; updateStatus('ready');
+              console.log("[Signaling] Already claimed by self");
+              localSDPRef.current = answerSDP;
+              updateStatus('ready');
             } else {
-              console.error("Signaling: Room full or claimed by others.");
+              console.error("[Signaling] Room full");
               updateStatus('room-full');
             }
           } else {
-            console.log("Signaling: Receiver slot claimed successfully.");
-            localSDPRef.current = answerSDP; updateStatus('ready');
+            console.log("[Signaling] Receiver slot claimed");
+            localSDPRef.current = answerSDP;
+            updateStatus('ready');
           }
           isSignalingRef.current = false;
         };
+
         pc.onicegatheringstatechange = () => {
-          console.log("Signaling: Receiver (Fetch) ICE Gathering State:", pc.iceGatheringState);
-          if (pc.iceGatheringState === 'complete' && !gatheringComplete) sendAnswer(pc.localDescription!);
+          console.log('[ICE Gathering] Receiver (fetch) state:', pc.iceGatheringState);
+          if (pc.iceGatheringState === 'complete' && !gatheringComplete) {
+            sendAnswer(pc.localDescription!);
+          }
         };
+
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(offer));
-          const answer = await pc.createAnswer(); await pc.setLocalDescription(answer);
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
         } catch (err) {
-          console.error("Signaling: Receiver (Fetch) SDP Error:", err);
+          console.error("[Signaling] Receiver (fetch) SDP Error:", err);
           isSignalingRef.current = false;
         }
       } else {
-        updateStatus('room-full'); isSignalingRef.current = false;
+        updateStatus('room-full');
+        isSignalingRef.current = false;
       }
-    } catch (err) { console.error(err); isSignalingRef.current = false; }
+    } catch (err) {
+      console.error('[Signaling] Error:', err);
+      isSignalingRef.current = false;
+    }
 
+    // 心跳机制
     heartbeatRef.current = addInterval(async () => {
       if (roleRef.current !== 'none') {
         try {
-          const updateField = roleRef.current === 'initiator' ? { initiator_id: peerId } : { receiver_id: peerId };
-          const { error } = await supabase.from('rooms_signaling').update({ ...updateField, updated_at: new Date().toISOString() }).eq('room_id', room_id);
+          const updateField = roleRef.current === 'initiator'
+            ? { initiator_id: peerId }
+            : { receiver_id: peerId };
+
+          const { error } = await supabase
+            .from('rooms_signaling')
+            .update({
+              ...updateField,
+              updated_at: new Date().toISOString()
+            })
+            .eq('room_id', room_id);
+
           if (error) {
-            console.warn("Heartbeat failed:", error.message);
+            console.warn("[Heartbeat] Failed:", error.message);
             heartbeatFailuresRef.current++;
+
             if (heartbeatFailuresRef.current >= 3 && connectionStatusRef.current === 'connected') {
               showToast("心跳失败，尝试重连...", "warning");
               heartbeatFailuresRef.current = 0;
@@ -595,31 +845,58 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
             heartbeatFailuresRef.current = 0;
           }
         } catch (e) {
-          console.error("Heartbeat error:", e);
+          console.error("[Heartbeat] Error:", e);
           heartbeatFailuresRef.current++;
         }
       }
     }, PROTOCOL_CONFIG.HEARTBEAT_INTERVAL);
-  }, [config.roomId, config.passphrase, peerId, showToast, cleanupResources, onExit, setupPeerConnection, updateStatus]);
+  }, [
+    config.roomId,
+    config.passphrase,
+    peerId,
+    showToast,
+    cleanupResources,
+    onExit,
+    setupPeerConnection,
+    updateStatus,
+    scheduleReconnect,
+    addTimeout,
+    addInterval
+  ]);
 
   useEffect(() => { joinAndSignalRef.current = joinAndSignal; }, [joinAndSignal]);
 
   const setupLocalParticipant = useCallback((stream: MediaStream | null, videoEnabled = true, joinSession = true) => {
     const canvas = filterCanvasRef.current;
-    const canvasStream = (canvas as any).captureStream(30);
+    const canvasStream = (canvas as any).captureStream(PROTOCOL_CONFIG.TARGET_FRAMERATE);
+
     if (stream) {
       const audioTrack = stream.getAudioTracks()[0];
-      if (audioTrack) { audioTrack.enabled = !isMutedRef.current; canvasStream.addTrack(audioTrack); }
+      if (audioTrack) {
+        audioTrack.enabled = !isMutedRef.current;
+        canvasStream.addTrack(audioTrack);
+      }
     }
+
     processedStreamRef.current = canvasStream;
-    addOrUpdateParticipant({ id: 'local', name: config.userName, isLocal: true, isHost: true, audioEnabled: !!stream && !isMutedRef.current, videoEnabled: !!stream && videoEnabled && filterRef.current === PrivacyFilter.NONE, stream: canvasStream });
+    addOrUpdateParticipant({
+      id: 'local',
+      name: config.userName,
+      isLocal: true,
+      isHost: true,
+      audioEnabled: !!stream && !isMutedRef.current,
+      videoEnabled: !!stream && videoEnabled && filterRef.current === PrivacyFilter.NONE,
+      stream: canvasStream
+    });
+
     if (joinSession) joinAndSignal();
   }, [config.userName, addOrUpdateParticipant, joinAndSignal]);
 
   const initMedia = useCallback(async (isRetry = false) => {
-    if (isInitializingRef.current) return; isInitializingRef.current = true;
+    if (isInitializingRef.current) return;
+    isInitializingRef.current = true;
+    console.log('[Media] Initializing...');
 
-    // Check Secure Context for Web Crypto
     if (!window.isSecureContext) {
       setConnectionStatus('security-error');
       showToast("安全上下文缺失：请使用 HTTPS 或 localhost 访问", "error");
@@ -628,49 +905,110 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
 
     try {
       encryptionKeyRef.current = await deriveKey(config.passphrase, config.roomId);
+      console.log('[Crypto] Encryption key derived');
     } catch (e) {
+      console.error('[Crypto] Key derivation failed:', e);
       setConnectionStatus('security-error');
       return;
     }
 
-    const isMobile = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+    const isMobile = isMobileDevice.current;
+    console.log(`[Media] Device type: ${isMobile ? 'Mobile' : 'Desktop'}`);
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      const constraints = {
         video: {
-          width: isMobile ? PROTOCOL_CONFIG.MOBILE_WIDTH : PROTOCOL_CONFIG.DESKTOP_WIDTH,
-          height: isMobile ? PROTOCOL_CONFIG.MOBILE_HEIGHT : PROTOCOL_CONFIG.DESKTOP_HEIGHT
+          width: {
+            ideal: isMobile ? PROTOCOL_CONFIG.MOBILE_WIDTH : PROTOCOL_CONFIG.DESKTOP_WIDTH
+          },
+          height: {
+            ideal: isMobile ? PROTOCOL_CONFIG.MOBILE_HEIGHT : PROTOCOL_CONFIG.DESKTOP_HEIGHT
+          },
+          frameRate: {
+            ideal: PROTOCOL_CONFIG.TARGET_FRAMERATE,
+            max: 30
+          },
+          // 移动端额外约束
+          ...(isMobile && {
+            facingMode: 'user',
+            aspectRatio: { ideal: 4 / 3 }
+          })
         },
-        audio: { echoCancellation: true, noiseSuppression: true }
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          // 移动端音频优化
+          ...(isMobile && {
+            sampleRate: 48000,
+            channelCount: 1
+          })
+        }
+      };
+
+      console.log('[Media] Requesting:', constraints);
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+
+      // 打印实际获取的轨道信息
+      stream.getTracks().forEach(track => {
+        const settings = track.getSettings();
+        console.log(`[Media] ${track.kind}:`, settings);
       });
+
       rawStreamRef.current = stream;
       setupLocalParticipant(stream);
-    } catch (err: any) {
-      console.warn("Media Access Error:", err.name, err.message);
+      console.log('[Media] Stream acquired successfully');
 
-      // Fallback for hardware in use or timeouts (AbortError)
-      if ((err.name === 'NotReadableError' || err.name === 'TrackStartError' || err.name === 'AbortError') && !isRetry) {
+    } catch (err: any) {
+      console.error("[Media] Access Error:", err.name, err.message);
+
+      // 降级策略：仅音频
+      if ((err.name === 'NotReadableError' ||
+        err.name === 'TrackStartError' ||
+        err.name === 'AbortError' ||
+        err.name === 'OverconstrainedError') && !isRetry) {
+
+        console.log('[Media] Attempting audio-only fallback');
         try {
-          const audioStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+          const audioStream = await navigator.mediaDevices.getUserMedia({
+            video: false,
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            }
+          });
+
           rawStreamRef.current = audioStream;
           setupLocalParticipant(audioStream, false);
+          showToast("已切换至语音模式", "warning");
+          console.log('[Media] Audio-only mode activated');
           return;
-        } catch (e) { console.error("Audio-only fallback failed:", e); }
+        } catch (e) {
+          console.error("[Media] Audio-only fallback failed:", e);
+        }
       }
 
+      // 用户提示
       if (err.name === 'NotAllowedError') {
         showToast("摄像头/麦克风权限被拒绝", "error");
       } else if (err.name === 'NotFoundError') {
         showToast("未检测到媒体设备", "warning");
-      } else if (err.name === 'AbortError') {
-        showToast("视频通道响应超时，已自动切至语音模式", "warning");
+      } else if (err.name === 'OverconstrainedError') {
+        showToast("设备不支持请求的配置，尝试降级", "warning");
       }
 
-      if (err.name === 'NotReadableError' || err.name === 'TrackStartError' || err.name === 'AbortError') {
+      // 无媒体模式
+      if (err.name === 'NotReadableError' ||
+        err.name === 'TrackStartError' ||
+        err.name === 'AbortError') {
         setupLocalParticipant(null, false);
         return;
       }
 
       setConnectionStatus('media-error');
+    } finally {
+      isInitializingRef.current = false;
     }
   }, [config.passphrase, config.roomId, setupLocalParticipant, showToast]);
 
@@ -679,35 +1017,98 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     return () => cleanupResources();
   }, [initMedia, cleanupResources]);
 
+  // 可见性变化处理 - 移动端优化
   useEffect(() => {
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible' && connectionStatusRef.current !== 'connected' && roleRef.current !== 'none') {
-        scheduleReconnect(500);
+      console.log('[Visibility]', document.visibilityState);
+
+      if (document.visibilityState === 'visible') {
+        // 移动端从后台返回时检查连接
+        if (connectionStatusRef.current !== 'connected' && roleRef.current !== 'none') {
+          console.log('[Visibility] Reconnecting after background');
+          scheduleReconnect(500);
+        }
+      } else {
+        // 进入后台时暂停视频渲染以节省资源
+        console.log('[Visibility] App backgrounded');
       }
     };
+
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
   }, [scheduleReconnect]);
 
+  // 网络状态监控 - 移动端优化
+  useEffect(() => {
+    const handleOnline = () => {
+      console.log('[Network] Back online');
+      if (connectionStatusRef.current !== 'connected') {
+        showToast("网络已恢复，正在重连...", "info");
+        scheduleReconnect(1000);
+      }
+    };
+
+    const handleOffline = () => {
+      console.log('[Network] Offline detected');
+      showToast("网络连接丢失", "error");
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, [showToast, scheduleReconnect]);
+
+  // 视频渲染循环
   useEffect(() => {
     let animationFrame: number;
     let lastWidth = 0, lastHeight = 0;
-    const canvas = filterCanvasRef.current, ctx = canvas.getContext('2d', { alpha: false });
-    const video = document.createElement('video'); video.muted = true; video.playsInline = true;
+    const canvas = filterCanvasRef.current;
+    const ctx = canvas.getContext('2d', { alpha: false });
+    const video = document.createElement('video');
+    video.muted = true;
+    video.playsInline = true;
+
     const render = () => {
       if (ctx && video.readyState >= 2 && rawStreamRef.current) {
-        if (video.videoWidth !== lastWidth || video.videoHeight !== lastHeight) { canvas.width = lastWidth = video.videoWidth; canvas.height = lastHeight = video.videoHeight; }
-        if (filterRef.current === PrivacyFilter.BLACK) { ctx.fillStyle = '#06080a'; ctx.fillRect(0, 0, canvas.width, canvas.height); }
-        else if (filterRef.current === PrivacyFilter.MOSAIC) {
-          const scale = 0.02, w = Math.max(1, canvas.width * scale), h = Math.max(1, canvas.height * scale);
-          ctx.imageSmoothingEnabled = false; ctx.drawImage(video, 0, 0, w, h);
-          ctx.filter = 'blur(10px)'; ctx.drawImage(canvas, 0, 0, w, h, 0, 0, canvas.width, canvas.height); ctx.filter = 'none';
-        } else ctx.drawImage(video, 0, 0);
+        if (video.videoWidth !== lastWidth || video.videoHeight !== lastHeight) {
+          canvas.width = lastWidth = video.videoWidth;
+          canvas.height = lastHeight = video.videoHeight;
+        }
+
+        if (filterRef.current === PrivacyFilter.BLACK) {
+          ctx.fillStyle = '#06080a';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+        } else if (filterRef.current === PrivacyFilter.MOSAIC) {
+          const scale = 0.02;
+          const w = Math.max(1, canvas.width * scale);
+          const h = Math.max(1, canvas.height * scale);
+          ctx.imageSmoothingEnabled = false;
+          ctx.drawImage(video, 0, 0, w, h);
+          ctx.filter = 'blur(10px)';
+          ctx.drawImage(canvas, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
+          ctx.filter = 'none';
+        } else {
+          ctx.drawImage(video, 0, 0);
+        }
       }
       animationFrame = requestAnimationFrame(render);
     };
-    const checker = addInterval(() => { if (rawStreamRef.current && video.srcObject !== rawStreamRef.current) { video.srcObject = rawStreamRef.current; video.play().catch((e) => { console.warn("Video play error:", e); }); } }, 1000);
+
+    const checker = addInterval(() => {
+      if (rawStreamRef.current && video.srcObject !== rawStreamRef.current) {
+        video.srcObject = rawStreamRef.current;
+        video.play().catch((e) => {
+          console.warn("[Video] Play error:", e);
+        });
+      }
+    }, 1000);
+
     render();
+
     return () => {
       cancelAnimationFrame(animationFrame);
       clearInterval(checker);
@@ -715,8 +1116,12 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     };
   }, [addInterval]);
 
-  useEffect(() => { filterRef.current = currentFilter; if (connectionStatus === 'connected') syncPrivacy(currentFilter, isMuted); }, [currentFilter, isMuted, connectionStatus, syncPrivacy]);
-
+  useEffect(() => {
+    filterRef.current = currentFilter;
+    if (connectionStatus === 'connected') {
+      syncPrivacy(currentFilter, isMuted);
+    }
+  }, [currentFilter, isMuted, connectionStatus, syncPrivacy]);
 
   const sendMessage = async (text: string) => {
     if (!encryptionKeyRef.current) return;
@@ -724,18 +1129,33 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       const encrypted = await encryptMessage(encryptionKeyRef.current, text);
       const payload = JSON.stringify({ type: 'chat', ...encrypted });
       let sent = false;
+
       dataChannelsRef.current.forEach(dc => {
         if (dc.readyState === 'open') {
           try {
-            dc.send(payload); sent = true;
+            dc.send(payload);
+            sent = true;
           } catch (e) {
-            console.error("DC Send Error:", e);
+            console.error("[DC] Send error:", e);
           }
         }
       });
-      if (sent) setMessages(prev => [...prev, { id: Date.now().toString(), senderId: 'local', senderName: config.userName, text, type: 'text', timestamp: Date.now() }]);
-      else showToast("链路断开，无法发送", "error");
-    } catch (e) { console.error("Encryption error:", e); }
+
+      if (sent) {
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          senderId: 'local',
+          senderName: config.userName,
+          text,
+          type: 'text',
+          timestamp: Date.now()
+        }]);
+      } else {
+        showToast("链路断开，无法发送", "error");
+      }
+    } catch (e) {
+      console.error("[Encryption] Error:", e);
+    }
   };
 
   const handleFileUpload = async (file: File) => {
@@ -743,29 +1163,57 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     if (file.size > PROTOCOL_CONFIG.MAX_FILE_SIZE) {
       return showToast(`文件过大，最大支持 ${PROTOCOL_CONFIG.MAX_FILE_SIZE / 1024 / 1024}MB`, "error");
     }
+
     const id = Math.random().toString(36).substring(7);
-    const meta: FileMetaPayload = { type: 'file-meta', id, name: file.name, size: file.size, mimeType: file.type };
+    const meta: FileMetaPayload = {
+      type: 'file-meta',
+      id,
+      name: file.name,
+      size: file.size,
+      mimeType: file.type
+    };
+
     let anyOpen = false;
-    dataChannelsRef.current.forEach(dc => { if (dc.readyState === 'open') { dc.send(JSON.stringify(meta)); anyOpen = true; } });
+    dataChannelsRef.current.forEach(dc => {
+      if (dc.readyState === 'open') {
+        dc.send(JSON.stringify(meta));
+        anyOpen = true;
+      }
+    });
+
     if (!anyOpen) return showToast("未检测到连接", "error");
 
-    // Create abort controller for this transfer
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
-    setFiles(prev => [{ id, name: file.name, size: file.size, progress: 0, status: 'transferring', mimeType: file.type }, ...prev]);
+    setFiles(prev => [{
+      id,
+      name: file.name,
+      size: file.size,
+      progress: 0,
+      status: 'transferring',
+      mimeType: file.type
+    }, ...prev]);
 
     try {
       const buf = await file.arrayBuffer();
       let off = 0;
 
-      const dc = Array.from(dataChannelsRef.current.values()).find((d: any) => d.readyState === 'open') as RTCDataChannel | undefined;
+      const dc = Array.from(dataChannelsRef.current.values()).find(
+        (d: any) => d.readyState === 'open'
+      ) as RTCDataChannel | undefined;
+
       if (!dc) throw new Error("No open channel");
 
       const sendNext = async () => {
-        if (controller.signal.aborted) return; // Check abort signal
+        if (controller.signal.aborted) return;
+
         try {
-          while (off < buf.byteLength && dc.readyState === 'open' && dc.bufferedAmount < PROTOCOL_CONFIG.BUFFER_THRESHOLD && !controller.signal.aborted) {
+          while (off < buf.byteLength &&
+            dc.readyState === 'open' &&
+            dc.bufferedAmount < PROTOCOL_CONFIG.BUFFER_THRESHOLD &&
+            !controller.signal.aborted) {
+
             const chunk = buf.slice(off, off + PROTOCOL_CONFIG.CHUNK_SIZE);
             const { data, iv } = await encryptBuffer(encryptionKeyRef.current!, chunk);
             const pack = new Uint8Array(iv.length + data.byteLength);
@@ -774,7 +1222,12 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
 
             dc.send(pack);
             off += chunk.byteLength;
-            setFiles(prev => prev.map(f => f.id === id ? { ...f, progress: Math.min(100, Math.round((off / file.size) * 100)) } : f));
+
+            setFiles(prev => prev.map(f =>
+              f.id === id
+                ? { ...f, progress: Math.min(100, Math.round((off / file.size) * 100)) }
+                : f
+            ));
           }
 
           if (controller.signal.aborted) {
@@ -790,14 +1243,24 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           } else if (dc.readyState === 'open') {
             const url = URL.createObjectURL(new Blob([buf], { type: file.type }));
             blobUrlsRef.current.add(url);
-            setMessages(prev => [...prev, { id, senderId: 'local', senderName: config.userName, blobUrl: url, type: file.type.startsWith('image/') ? 'image' : 'file', fileName: file.name, timestamp: Date.now() }]);
+
+            setMessages(prev => [...prev, {
+              id,
+              senderId: 'local',
+              senderName: config.userName,
+              blobUrl: url,
+              type: file.type.startsWith('image/') ? 'image' : 'file',
+              fileName: file.name,
+              timestamp: Date.now()
+            }]);
+
             setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'completed' } : f));
             abortControllerRef.current = null;
           } else {
             throw new Error("Channel closed during transfer");
           }
         } catch (e) {
-          console.error("File transfer process error:", e);
+          console.error("[File] Transfer error:", e);
           setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'failed' } : f));
           showToast("文件传输中断", "error");
           abortControllerRef.current = null;
@@ -805,39 +1268,44 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       };
 
       dc.onclose = () => {
-        console.warn("DC Closed during active transfer, aborting.");
+        console.warn("[DC] Closed during file transfer");
         controller.abort();
-        setFiles(prev => prev.map(f => f.id === id && f.status === 'transferring' ? { ...f, status: 'failed' } : f));
+        setFiles(prev => prev.map(f =>
+          f.id === id && f.status === 'transferring' ? { ...f, status: 'failed' } : f
+        ));
       };
 
       dc.bufferedAmountLowThreshold = PROTOCOL_CONFIG.BUFFER_THRESHOLD / 2;
       sendNext();
+
     } catch (e) {
-      console.error("File upload init error:", e);
+      console.error("[File] Upload init error:", e);
       setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'failed' } : f));
       showToast("文件发送异常", "error");
       abortControllerRef.current = null;
     }
   };
 
-
   return (
     <div className="flex flex-col h-[100dvh] bg-background overflow-hidden relative font-sans selection:bg-primary/30">
-      {/* Dynamic Toast System */}
+      {/* Toast System */}
       {toast && (
         <div className="fixed top-24 left-1/2 -translate-x-1/2 z-[1000] animate-in fade-in slide-in-from-top-4 duration-500">
           <div className={`px-8 py-4 rounded-[2rem] glass shadow-3xl flex items-center gap-4 border-2 ${toast.type === 'error' ? 'border-red-500/30' :
             toast.type === 'warning' ? 'border-amber-500/30' : 'border-primary/30'
             }`}>
             <span className={`size-2.5 rounded-full animate-pulse ${toast.type === 'error' ? 'bg-red-500 shadow-[0_0_10px_#ef4444]' :
-              toast.type === 'warning' ? 'bg-amber-500 shadow-[0_0_10px_#f59e0b]' : 'bg-primary shadow-[0_0_10px_#137fec]'
+              toast.type === 'warning' ? 'bg-amber-500 shadow-[0_0_10px_#f59e0b]' :
+                'bg-primary shadow-[0_0_10px_#137fec]'
               }`}></span>
-            <span className="text-[11px] font-black uppercase tracking-[0.2em] text-white/90">{toast.msg}</span>
+            <span className="text-[11px] font-black uppercase tracking-[0.2em] text-white/90">
+              {toast.msg}
+            </span>
           </div>
         </div>
       )}
 
-      {/* Primary Header */}
+      {/* Header */}
       <header className="h-[60px] lg:h-20 shrink-0 flex items-center justify-between px-4 lg:px-10 z-[100] relative border-b border-white/5 bg-background/50 backdrop-blur-3xl">
         <div className="flex items-center gap-4 lg:gap-6">
           <div className="size-10 lg:size-12 bg-primary/20 rounded-2xl flex items-center justify-center border border-primary/30 shadow-inner">
@@ -845,11 +1313,18 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           </div>
           <div className="flex flex-col">
             <div className="flex items-center gap-2 mb-1">
-              <span className="text-[10px] lg:text-[11px] font-black tracking-[0.3em] text-gray-500 uppercase">安全加密频道</span>
-              <span className="px-2 py-0.5 rounded-full bg-white/5 border border-white/10 text-[8px] font-mono text-gray-600">v1.2</span>
+              <span className="text-[10px] lg:text-[11px] font-black tracking-[0.3em] text-gray-500 uppercase">
+                安全加密频道
+              </span>
+              <span className="px-2 py-0.5 rounded-full bg-white/5 border border-white/10 text-[8px] font-mono text-gray-600">
+                v1.3
+              </span>
             </div>
             <div className="flex items-center gap-2.5">
-              <span className={`size-2 rounded-full ${connectionStatus === 'connected' ? 'bg-accent shadow-[0_0_12px_#22c55e]' : 'bg-amber-500 animate-pulse'}`}></span>
+              <span className={`size-2 rounded-full ${connectionStatus === 'connected'
+                ? 'bg-accent shadow-[0_0_12px_#22c55e]'
+                : 'bg-amber-500 animate-pulse'
+                }`}></span>
               <span className="text-[10px] lg:text-[12px] font-black text-white uppercase tracking-widest selection:bg-primary/30">
                 {connectionStatus === 'connected' ? '零信任加密连通' :
                   connectionStatus === 'preparing' ? '正在建立端对端隧道...' :
@@ -884,16 +1359,23 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
             <p className="text-gray-500 max-w-sm font-medium leading-relaxed mb-10">
               {connectionStatus === 'security-error' ? 'Web Crypto 需要 HTTPS 或 Localhost 安全上下文才能运行。请检查您的 URL。' :
                 connectionStatus === 'media-error' ? '检测到硬件资源冲突、权限被拒绝或设备不可用，请检查浏览器权限设置。' :
-                  '当前房间已有两人在进行主权通话，请开启新房间。'}
+                  '当前房间已有两人在进行主权通话,请开启新房间。'}
             </p>
-            <button onClick={onExit} className="px-12 h-16 rounded-[2rem] bg-white text-black font-black uppercase tracking-widest hover:scale-105 active:scale-95 transition-all">返回大厅</button>
+            <button
+              onClick={onExit}
+              className="px-12 h-16 rounded-[2rem] bg-white text-black font-black uppercase tracking-widest hover:scale-105 active:scale-95 transition-all"
+            >
+              返回大厅
+            </button>
           </div>
         ) : connectionStatus !== 'connected' ? (
           <div className="absolute inset-0 z-[400] bg-background flex flex-col items-center justify-center p-12 space-y-12 animate-in fade-in duration-1000">
             <div className="relative">
               <div className="size-40 rounded-full border-[6px] border-primary/20 border-t-primary animate-spin"></div>
               <div className="absolute inset-0 flex items-center justify-center">
-                <span className="material-symbols-outlined text-5xl text-primary animate-pulse fill-1">shield_with_heart</span>
+                <span className="material-symbols-outlined text-5xl text-primary animate-pulse fill-1">
+                  shield_with_heart
+                </span>
               </div>
             </div>
             <div className="text-center space-y-4">
@@ -909,16 +1391,22 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           <div className="w-full h-full relative">
             <div className="absolute inset-0 z-0">
               {remoteParticipant ? (
-                <VideoCard participant={remoteParticipant} filter={isRemoteHidden ? PrivacyFilter.BLACK : PrivacyFilter.NONE} isLarge />
+                <VideoCard
+                  participant={remoteParticipant}
+                  filter={isRemoteHidden ? PrivacyFilter.BLACK : PrivacyFilter.NONE}
+                  isLarge
+                />
               ) : (
                 <div className="w-full h-full flex flex-col items-center justify-center space-y-8 opacity-20 bg-surface">
                   <div className="size-20 rounded-full border-4 border-primary/10 border-t-primary animate-spin"></div>
-                  <p className="text-xs font-black uppercase tracking-[0.6em] text-white">同步加密链路...</p>
+                  <p className="text-xs font-black uppercase tracking-[0.6em] text-white">
+                    同步加密链路...
+                  </p>
                 </div>
               )}
             </div>
 
-            {/* Floating Local Preview Overlay - Ultra Size (Bottom Left floating) */}
+            {/* Local Preview */}
             {showLocalPreview && localParticipant && (
               <div className="absolute bottom-40 lg:bottom-[10.5rem] left-4 lg:left-8 w-48 sm:w-64 md:w-80 lg:w-96 aspect-video z-50 rounded-2xl lg:rounded-[2.5rem] overflow-hidden shadow-[0_40px_80px_rgba(0,0,0,0.9)] border-2 border-primary/20 backdrop-blur-xl transition-all hover:scale-[1.05] animate-in zoom-in-95 slide-in-from-bottom-20 duration-1000">
                 <VideoCard participant={localParticipant} filter={currentFilter} />
@@ -928,44 +1416,107 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           </div>
         )}
 
-        {/* Cinematic Chat & File Sidebar - Epic Overlay Logic */}
-        <div className={`fixed inset-y-0 right-0 w-full md:w-[400px] lg:w-[480px] glass transform transition-all duration-700 ease-out z-[300] flex flex-col shadow-[-40px_0_100px_rgba(0,0,0,0.6)] ${isChatOpen ? 'translate-x-0' : 'translate-x-full'}`}>
+        {/* Chat Sidebar */}
+        <div className={`fixed inset-y-0 right-0 w-full md:w-[400px] lg:w-[480px] glass transform transition-all duration-700 ease-out z-[300] flex flex-col shadow-[-40px_0_100px_rgba(0,0,0,0.6)] ${isChatOpen ? 'translate-x-0' : 'translate-x-full'
+          }`}>
           <div className="h-20 flex items-center justify-between px-phi-lg border-b border-white/10 bg-black shrink-0">
             <div className="flex items-center gap-phi-md">
               <div className="size-2.5 rounded-full bg-accent animate-pulse shadow-[0_0_15px_var(--color-accent)]"></div>
-              <h3 className="text-xs font-black uppercase tracking-[0.4em] text-white/90">安全加密隧道</h3>
+              <h3 className="text-xs font-black uppercase tracking-[0.4em] text-white/90">
+                安全加密隧道
+              </h3>
             </div>
-            <button onClick={() => setIsChatOpen(false)} className="size-12 rounded-2xl hover:bg-white/5 flex items-center justify-center text-gray-400 active:scale-90 transition-all">
+            <button
+              onClick={() => setIsChatOpen(false)}
+              className="size-12 rounded-2xl hover:bg-white/5 flex items-center justify-center text-gray-400 active:scale-90 transition-all"
+            >
               <span className="material-symbols-outlined text-3xl">close</span>
             </button>
           </div>
           <div className="flex-1 overflow-hidden bg-[#040608]/90 backdrop-blur-3xl flex flex-col relative">
-            <ChatBox messages={messages} onSend={sendMessage} onUpload={handleFileUpload} userName={config.userName} isChatOpen={isChatOpen} />
+            <ChatBox
+              messages={messages}
+              onSend={sendMessage}
+              onUpload={handleFileUpload}
+              userName={config.userName}
+              isChatOpen={isChatOpen}
+            />
           </div>
         </div>
 
-        {/* Global Control Navigation - Intelligent Positioning with Sentient Kinetics */}
+        {/* Control Panel */}
         {connectionStatus === 'connected' && (
           <div
-            style={isChatOpen ? { transform: `translateX(calc(-50% - ${window.innerWidth >= 1024 ? '240px' : '200px'}))` } : { transform: 'translateX(-50%)' }}
+            style={isChatOpen
+              ? { transform: `translateX(calc(-50% - ${window.innerWidth >= 1024 ? '240px' : '200px'}))` }
+              : { transform: 'translateX(-50%)' }
+            }
             className={`fixed bottom-phi-lg lg:bottom-phi-xl left-1/2 flex items-center p-phi-xs lg:p-phi-sm glass rounded-[5rem] shadow-[0_50px_100px_rgba(0,0,0,0.9)] border border-white/10 transition-all duration-700 z-[500] 
               ${isChatOpen ? 'opacity-0 lg:opacity-100 pointer-events-none lg:pointer-events-auto scale-90 lg:scale-100' : 'animate-sentient-in'}
               max-w-[calc(100vw-1rem)] md:max-w-none`}
           >
             <div className="flex items-center gap-1 xl:gap-phi-md px-1 lg:px-phi-md overflow-x-auto no-scrollbar scroll-smooth">
-              <ControlBtn icon={isMuted ? 'mic_off' : 'mic'} active={!isMuted} onClick={() => setIsMuted(!isMuted)} danger={isMuted} label="麦克风" />
-              <ControlBtn icon="blur_on" active={currentFilter === PrivacyFilter.MOSAIC} onClick={() => setCurrentFilter(prev => prev === PrivacyFilter.MOSAIC ? PrivacyFilter.NONE : PrivacyFilter.MOSAIC)} label="马赛克" />
-              <ControlBtn icon={currentFilter === PrivacyFilter.BLACK ? 'visibility_off' : 'videocam'} active={currentFilter !== PrivacyFilter.BLACK} onClick={() => setCurrentFilter(prev => prev === PrivacyFilter.BLACK ? PrivacyFilter.NONE : PrivacyFilter.BLACK)} danger={currentFilter === PrivacyFilter.BLACK} label="屏蔽" />
-              <ControlBtn icon={showLocalPreview ? 'picture_in_picture' : 'picture_in_picture_alt'} active={showLocalPreview} onClick={() => setShowLocalPreview(!showLocalPreview)} label="预览" />
+              <ControlBtn
+                icon={isMuted ? 'mic_off' : 'mic'}
+                active={!isMuted}
+                onClick={() => setIsMuted(!isMuted)}
+                danger={isMuted}
+                label="麦克风"
+              />
+              <ControlBtn
+                icon="blur_on"
+                active={currentFilter === PrivacyFilter.MOSAIC}
+                onClick={() => setCurrentFilter(prev =>
+                  prev === PrivacyFilter.MOSAIC ? PrivacyFilter.NONE : PrivacyFilter.MOSAIC
+                )}
+                label="马赛克"
+              />
+              <ControlBtn
+                icon={currentFilter === PrivacyFilter.BLACK ? 'visibility_off' : 'videocam'}
+                active={currentFilter !== PrivacyFilter.BLACK}
+                onClick={() => setCurrentFilter(prev =>
+                  prev === PrivacyFilter.BLACK ? PrivacyFilter.NONE : PrivacyFilter.BLACK
+                )}
+                danger={currentFilter === PrivacyFilter.BLACK}
+                label="屏蔽"
+              />
+              <ControlBtn
+                icon={showLocalPreview ? 'picture_in_picture' : 'picture_in_picture_alt'}
+                active={showLocalPreview}
+                onClick={() => setShowLocalPreview(!showLocalPreview)}
+                label="预览"
+              />
             </div>
+
             <div className="w-px h-8 lg:h-12 bg-white/15 mx-0.5 lg:mx-phi-sm shrink-0"></div>
+
             <div className="flex items-center gap-1 xl:gap-phi-md px-1 lg:px-phi-md">
-              <ControlBtn icon={isRemoteMuted ? 'volume_off' : 'volume_up'} active={!isRemoteMuted} onClick={() => setIsRemoteMuted(!isRemoteMuted)} danger={isRemoteMuted} label="监听" />
-              <ControlBtn icon={isRemoteHidden ? 'hide_image' : 'person'} active={!isRemoteHidden} onClick={() => setIsRemoteHidden(!isRemoteHidden)} danger={isRemoteHidden} label="视线" />
+              <ControlBtn
+                icon={isRemoteMuted ? 'volume_off' : 'volume_up'}
+                active={!isRemoteMuted}
+                onClick={() => setIsRemoteMuted(!isRemoteMuted)}
+                danger={isRemoteMuted}
+                label="监听"
+              />
+              <ControlBtn
+                icon={isRemoteHidden ? 'hide_image' : 'person'}
+                active={!isRemoteHidden}
+                onClick={() => setIsRemoteHidden(!isRemoteHidden)}
+                danger={isRemoteHidden}
+                label="视线"
+              />
             </div>
+
             <div className="w-px h-8 lg:h-12 bg-white/15 mx-0.5 lg:mx-phi-sm shrink-0"></div>
+
             <div className="px-1 lg:px-phi-md">
-              <ControlBtn icon="forum" active={isChatOpen} onClick={() => setIsChatOpen(!isChatOpen)} label="消息" badge={messages.filter(m => m.senderId !== 'local').length > 0} />
+              <ControlBtn
+                icon="forum"
+                active={isChatOpen}
+                onClick={() => setIsChatOpen(!isChatOpen)}
+                label="消息"
+                badge={messages.filter(m => m.senderId !== 'local').length > 0}
+              />
             </div>
           </div>
         )}
@@ -974,62 +1525,140 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   );
 };
 
-const ControlBtn = ({ icon, active, onClick, danger, label, badge, className = '' }: { icon: string; active: boolean; onClick: () => void; danger?: boolean; label: string; badge?: boolean, className?: string }) => (
+const ControlBtn = ({
+  icon,
+  active,
+  onClick,
+  danger,
+  label,
+  badge,
+  className = ''
+}: {
+  icon: string;
+  active: boolean;
+  onClick: () => void;
+  danger?: boolean;
+  label: string;
+  badge?: boolean;
+  className?: string;
+}) => (
   <div className={`flex flex-col items-center gap-1.5 lg:gap-2 group shrink-0 ${className}`}>
     <button
       onClick={onClick}
-      className={`relative size-9 lg:size-16 rounded-full flex items-center justify-center transition-all border ${active ? 'bg-primary/10 border-primary/30 text-primary' : (danger ? 'bg-red-500/10 border-red-500/30 text-red-500' : 'bg-white/5 border-white/5 text-gray-400 hover:border-white/20 hover:text-white')} hover:scale-110 active:scale-90 shadow-xl`}
+      className={`relative size-9 lg:size-16 rounded-full flex items-center justify-center transition-all border ${active
+        ? 'bg-primary/10 border-primary/30 text-primary'
+        : (danger
+          ? 'bg-red-500/10 border-red-500/30 text-red-500'
+          : 'bg-white/5 border-white/5 text-gray-400 hover:border-white/20 hover:text-white'
+        )
+        } hover:scale-110 active:scale-90 shadow-xl`}
     >
-      <span className="material-symbols-outlined text-[16px] lg:text-[28px] transition-transform duration-300">{icon}</span>
-      {badge && <span className="absolute top-0.5 right-0.5 size-2.5 bg-red-500 rounded-full border-2 border-background animate-bounce shadow-[0_0_8px_#ef4444]"></span>}
+      <span className="material-symbols-outlined text-[16px] lg:text-[28px] transition-transform duration-300">
+        {icon}
+      </span>
+      {badge && (
+        <span className="absolute top-0.5 right-0.5 size-2.5 bg-red-500 rounded-full border-2 border-background animate-bounce shadow-[0_0_8px_#ef4444]"></span>
+      )}
     </button>
-    <span className="text-[7px] lg:text-[9px] font-black uppercase text-gray-500 hidden lg:block tracking-widest">{label}</span>
+    <span className="text-[7px] lg:text-[9px] font-black uppercase text-gray-500 hidden lg:block tracking-widest">
+      {label}
+    </span>
   </div>
 );
 
-const ChatBox = ({ messages, onSend, onUpload, userName, isChatOpen }: { messages: ChatMessage[]; onSend: (t: string) => void; onUpload: (f: File) => void; userName: string, isChatOpen: boolean }) => {
+const ChatBox = ({
+  messages,
+  onSend,
+  onUpload,
+  userName,
+  isChatOpen
+}: {
+  messages: ChatMessage[];
+  onSend: (t: string) => void;
+  onUpload: (f: File) => void;
+  userName: string;
+  isChatOpen: boolean;
+}) => {
   const [text, setText] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     if (scrollRef.current && isChatOpen) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages, isChatOpen]);
-  const handleMessageSubmit = (e: React.FormEvent) => { e.preventDefault(); if (text.trim()) { onSend(text); setText(''); } };
+
+  const handleMessageSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (text.trim()) {
+      onSend(text);
+      setText('');
+    }
+  };
 
   return (
     <div className="flex flex-col h-full relative">
-      <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 lg:p-10 space-y-4 lg:space-y-6 pb-32 lg:pb-40 custom-scrollbar overscroll-contain">
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto p-4 lg:p-10 space-y-4 lg:space-y-6 pb-32 lg:pb-40 custom-scrollbar overscroll-contain"
+      >
         {messages.length === 0 && (
           <div className="h-full flex flex-col items-center justify-center text-center opacity-30 py-20 lg:py-24 grayscale">
             <div className="size-16 lg:size-20 rounded-full bg-surface border border-white/10 flex items-center justify-center mb-4 lg:mb-6">
               <span className="material-symbols-outlined text-3xl lg:text-4xl">vpn_lock</span>
             </div>
-            <p className="text-[10px] lg:text-xs font-black uppercase tracking-[0.4em]">端对端隧道就绪</p>
+            <p className="text-[10px] lg:text-xs font-black uppercase tracking-[0.4em]">
+              端对端隧道就绪
+            </p>
           </div>
         )}
         {messages.map(m => (
-          <div key={m.id} className={`flex flex-col ${m.senderId === 'local' ? 'items-end' : 'items-start'} animate-in fade-in slide-in-from-bottom-4 duration-500`}>
+          <div
+            key={m.id}
+            className={`flex flex-col ${m.senderId === 'local' ? 'items-end' : 'items-start'
+              } animate-in fade-in slide-in-from-bottom-4 duration-500`}
+          >
             <div className="flex items-center gap-3 mb-2 px-2">
-              <span className="text-[10px] font-black uppercase text-gray-600 tracking-wider transition-colors hover:text-primary">{m.senderName}</span>
-              <span className="text-[9px] font-mono text-gray-800">{new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+              <span className="text-[10px] font-black uppercase text-gray-600 tracking-wider transition-colors hover:text-primary">
+                {m.senderName}
+              </span>
+              <span className="text-[9px] font-mono text-gray-800">
+                {new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              </span>
             </div>
-            <div className={`rounded-3xl max-w-[90%] overflow-hidden shadow-2xl transition-all hover:scale-[1.01] ${m.senderId === 'local' ? 'bg-primary text-white rounded-tr-none' : 'bg-surface border border-white/10 text-gray-200 rounded-tl-none'}`}>
-              {m.type === 'text' && <p className="px-6 py-4 text-sm leading-relaxed break-words font-medium">{m.text}</p>}
+            <div className={`rounded-3xl max-w-[90%] overflow-hidden shadow-2xl transition-all hover:scale-[1.01] ${m.senderId === 'local'
+              ? 'bg-primary text-white rounded-tr-none'
+              : 'bg-surface border border-white/10 text-gray-200 rounded-tl-none'
+              }`}>
+              {m.type === 'text' && (
+                <p className="px-6 py-4 text-sm leading-relaxed break-words font-medium">
+                  {m.text}
+                </p>
+              )}
               {m.blobUrl && (
                 <div className="relative group min-w-[240px]">
-                  {m.type === 'image' ? <img src={m.blobUrl} className="w-full h-auto max-h-[500px] object-cover" /> : (
+                  {m.type === 'image' ? (
+                    <img src={m.blobUrl} className="w-full h-auto max-h-[500px] object-cover" />
+                  ) : (
                     <div className="p-6 flex items-center gap-5 bg-black/20">
                       <div className="size-12 rounded-2xl bg-primary/10 flex items-center justify-center text-primary border border-primary/20">
                         <span className="material-symbols-outlined text-2xl">insert_drive_file</span>
                       </div>
                       <div className="flex flex-col min-w-0">
-                        <span className="text-sm font-bold truncate text-white uppercase tracking-tight">{m.fileName}</span>
-                        <span className="text-[10px] opacity-40 uppercase tracking-[0.2em] font-black">加密二进制流</span>
+                        <span className="text-sm font-bold truncate text-white uppercase tracking-tight">
+                          {m.fileName}
+                        </span>
+                        <span className="text-[10px] opacity-40 uppercase tracking-[0.2em] font-black">
+                          加密二进制流
+                        </span>
                       </div>
                     </div>
                   )}
-                  <a href={m.blobUrl} download={m.fileName} className="absolute inset-0 bg-primary/20 backdrop-blur-sm opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                  <a
+                    href={m.blobUrl}
+                    download={m.fileName}
+                    className="absolute inset-0 bg-primary/20 backdrop-blur-sm opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center"
+                  >
                     <div className="size-14 bg-white text-black rounded-3xl flex items-center justify-center shadow-3xl transform -translate-y-4 group-hover:translate-y-0 transition-transform">
                       <span className="material-symbols-outlined text-2xl">download</span>
                     </div>
@@ -1044,7 +1673,14 @@ const ChatBox = ({ messages, onSend, onUpload, userName, isChatOpen }: { message
       <div className="absolute bottom-0 inset-x-0 p-phi-md lg:p-phi-xl bg-gradient-to-t from-black via-black/95 to-transparent backdrop-blur-xl pb-[calc(1.618rem+env(safe-area-inset-bottom))] lg:translate-z-0">
         <form onSubmit={handleMessageSubmit} className="flex gap-phi-sm items-center max-w-4xl mx-auto">
           <label className="shrink-0 size-12 lg:size-14 bg-white/5 border border-white/10 text-gray-400 rounded-2xl flex items-center justify-center cursor-pointer active:scale-95 hover:bg-white/10 hover:border-white/20 transition-all">
-            <input type="file" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) onUpload(f); }} />
+            <input
+              type="file"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) onUpload(f);
+              }}
+            />
             <span className="material-symbols-outlined text-xl lg:text-2xl">add</span>
           </label>
           <div className="flex-1 relative">
@@ -1053,10 +1689,19 @@ const ChatBox = ({ messages, onSend, onUpload, userName, isChatOpen }: { message
               placeholder="发送加密信息..."
               value={text}
               onChange={(e) => setText(e.target.value)}
-              onFocus={() => setTimeout(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' }), 300)}
+              onFocus={() => setTimeout(() =>
+                scrollRef.current?.scrollTo({
+                  top: scrollRef.current.scrollHeight,
+                  behavior: 'smooth'
+                }), 300
+              )}
             />
           </div>
-          <button type="submit" disabled={!text.trim()} className="shrink-0 size-12 lg:size-14 bg-primary text-white rounded-xl lg:rounded-2xl flex items-center justify-center disabled:opacity-20 active:scale-95 shadow-[0_10px_20px_-5px_rgba(19,127,236,0.4)] transition-all">
+          <button
+            type="submit"
+            disabled={!text.trim()}
+            className="shrink-0 size-12 lg:size-14 bg-primary text-white rounded-xl lg:rounded-2xl flex items-center justify-center disabled:opacity-20 active:scale-95 shadow-[0_10px_20px_-5px_rgba(19,127,236,0.4)] transition-all"
+          >
             <span className="material-symbols-outlined text-xl lg:text-2xl fill-1">send</span>
           </button>
         </form>
