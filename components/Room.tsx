@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { RoomConfig, Participant, PrivacyFilter, ChatMessage, FileTransfer, ReceivingFileState, FileMetaPayload } from '../types';
+import { RoomConfig, Participant, PrivacyFilter, ChatMessage, FileTransfer, ReceivingFileState, FileMetaPayload, NetworkStats } from '../types';
 import { deriveKey, encryptMessage, decryptMessage, encryptBuffer, decryptBuffer, hashPassphrase } from '../crypto';
 import { supabase } from '../supabase';
 import VideoCard from './VideoCard';
@@ -61,6 +61,14 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const [isRemoteHidden, setIsRemoteHidden] = useState(false);
   const [showLocalPreview, setShowLocalPreview] = useState(true);
   const [toast, setToast] = useState<{ msg: string; type: 'info' | 'error' | 'warning' } | null>(null);
+  const [netStats, setNetStats] = useState<NetworkStats>({
+    bitrate: 0,
+    framerate: 0,
+    packetLoss: 0,
+    rtt: 0,
+    jitter: 0,
+    quality: 'excellent'
+  });
 
   const localParticipant = participants.find(p => p.isLocal);
   const remoteParticipant = participants.find(p => !p.isLocal);
@@ -127,6 +135,18 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const heartbeatFailuresRef = useRef(0);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const audioModulesRef = useRef<{
+    source?: MediaStreamAudioSourceNode;
+    destination?: MediaStreamAudioDestinationNode;
+    highpass?: BiquadFilterNode;
+    compressor?: DynamicsCompressorNode;
+    gainNode?: GainNode;
+    lowpass?: BiquadFilterNode;
+  }>({});
+  const currentBitrateRef = useRef(isMobileDevice.current ? PROTOCOL_CONFIG.MOBILE_BITRATE_KBPS : PROTOCOL_CONFIG.MAX_BITRATE_KBPS);
+  const statsIntervalRef = useRef<number | null>(null);
+  const renderPrevTimeRef = useRef(0);
 
   const updateStatus = useCallback((s: typeof connectionStatus) => {
     setConnectionStatus(s);
@@ -302,6 +322,135 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     };
   }, [showToast, handleManualExit, handleFileMetaReceive, handleFileChunkReceive]);
 
+  // --- 音频处理链 ---
+  const setupAudioProcessing = useCallback((stream: MediaStream): MediaStreamTrack => {
+    const audioTrack = stream.getAudioTracks()[0];
+    if (!audioTrack) return audioTrack;
+
+    try {
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
+          sampleRate: 48000,
+          latencyHint: 'interactive'
+        });
+      }
+      const ctx = audioCtxRef.current;
+
+      // 清理旧节点
+      if (audioModulesRef.current.source) audioModulesRef.current.source.disconnect();
+
+      const source = ctx.createMediaStreamSource(new MediaStream([audioTrack]));
+      const destination = ctx.createMediaStreamDestination();
+
+      // 高通滤波：移除低于 80Hz 的低频噪声
+      const highpass = ctx.createBiquadFilter();
+      highpass.type = 'highpass';
+      highpass.frequency.value = 80;
+
+      // 动态压缩：平抑爆音，提升细节
+      const compressor = ctx.createDynamicsCompressor();
+      compressor.threshold.value = -45;
+      compressor.knee.value = 40;
+      compressor.ratio.value = 12;
+      compressor.attack.value = 0;
+      compressor.release.value = 0.25;
+
+      // 增益控制：补偿压缩后的音量
+      const gainNode = ctx.createGain();
+      gainNode.gain.value = 1.3;
+
+      // 低通滤波：移除高于 8000Hz 的高频杂音
+      const lowpass = ctx.createBiquadFilter();
+      lowpass.type = 'lowpass';
+      lowpass.frequency.value = 8000;
+
+      source.connect(highpass);
+      highpass.connect(compressor);
+      compressor.connect(gainNode);
+      gainNode.connect(lowpass);
+      lowpass.connect(destination);
+
+      audioModulesRef.current = { source, destination, highpass, compressor, gainNode, lowpass };
+      console.log("[Audio] Processing pipeline initialized");
+
+      return destination.stream.getAudioTracks()[0];
+    } catch (e) {
+      console.warn("[Audio] Custom processing failed, falling back to raw:", e);
+      return audioTrack;
+    }
+  }, []);
+
+  // --- 网络质量评估 ---
+  const calculateQuality = (loss: number, rtt: number, jitter: number): NetworkStats['quality'] => {
+    if (loss < 0.01 && rtt < 120 && jitter < 20) return 'excellent';
+    if (loss < 0.04 && rtt < 250 && jitter < 50) return 'good';
+    if (loss < 0.10 && rtt < 450 && jitter < 100) return 'fair';
+    return 'poor';
+  };
+
+  // --- 自适应码率控制 ---
+  const startNetworkMonitoring = useCallback((pc: RTCPeerConnection) => {
+    if (statsIntervalRef.current) clearInterval(statsIntervalRef.current);
+
+    statsIntervalRef.current = window.setInterval(async () => {
+      const senders = pc.getSenders();
+      const videoSender = senders.find(s => s.track && s.track.kind === 'video');
+      if (!videoSender) return;
+
+      try {
+        const stats = await pc.getStats();
+        let currentLoss = 0, currentRTT = 0, currentJitter = 0, currentFPS = 0;
+
+        stats.forEach(report => {
+          if (report.type === 'remote-inbound-rtp' && report.kind === 'video') {
+            currentLoss = report.packetsLost / (report.packetsReceived + report.packetsLost) || 0;
+            currentRTT = report.roundTripTime * 1000 || 0;
+            currentJitter = report.jitter * 1000 || 0;
+          }
+          if (report.type === 'outbound-rtp' && report.kind === 'video') {
+            currentFPS = report.framesPerSecond || 0;
+          }
+        });
+
+        const quality = calculateQuality(currentLoss, currentRTT, currentJitter);
+        const kbps = Math.round(currentBitrateRef.current);
+
+        setNetStats({
+          bitrate: kbps,
+          framerate: Math.round(currentFPS),
+          packetLoss: Math.round(currentLoss * 100),
+          rtt: Math.round(currentRTT),
+          jitter: Math.round(currentJitter),
+          quality
+        });
+
+        // 动态调优码率
+        const params = videoSender.getParameters();
+        if (!params.encodings || params.encodings.length === 0) return;
+
+        let target = currentBitrateRef.current;
+        const maxLimit = isMobileDevice.current ? PROTOCOL_CONFIG.MOBILE_BITRATE_KBPS : PROTOCOL_CONFIG.MAX_BITRATE_KBPS;
+
+        if (currentLoss > 0.08 || currentRTT > 400) {
+          target = Math.max(200, target * 0.75); // 严重拥塞：大幅降低
+        } else if (currentLoss > 0.03 || currentRTT > 200) {
+          target = Math.max(200, target * 0.9);  // 中度拥塞
+        } else if (currentLoss < 0.01 && currentRTT < 150 && target < maxLimit) {
+          target = Math.min(maxLimit, target * 1.15); // 网络极好：提升探索
+        }
+
+        if (Math.abs(target - currentBitrateRef.current) > 20) {
+          currentBitrateRef.current = target;
+          params.encodings[0].maxBitrate = target * 1000;
+          await videoSender.setParameters(params);
+          console.log(`[ABR] Bitrate adjusted: ${Math.round(target)} kbps | Quality: ${quality}`);
+        }
+      } catch (e) {
+        console.warn("[ABR] Monitor error:", e);
+      }
+    }, 2500);
+  }, []);
+
   const setupPeerConnection = useCallback(async (remoteId: string, isOffer: boolean): Promise<RTCPeerConnection> => {
     const pc = new RTCPeerConnection({
       iceServers: [
@@ -311,7 +460,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         { urls: 'stun:stun.cloudflare.com:3478' },
         { urls: 'stun:stun.qq.com:3478' },
       ],
-      iceCandidatePoolSize: 0, // 移动端设为 0，减少资源消耗
+      iceCandidatePoolSize: isMobileDevice.current ? 5 : 10, // 增加预收集，提升连接速度
       bundlePolicy: 'max-bundle',
       rtcpMuxPolicy: 'require',
       // 移动端优化：启用持续收集
@@ -383,6 +532,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         syncPrivacy(filterRef.current, isMutedRef.current);
         showToast("端对端隧道已建立", "info");
         heartbeatFailuresRef.current = 0;
+        startNetworkMonitoring(pc); // 启动网络监控
       }
 
       if (pc.connectionState === 'disconnected') {
@@ -871,10 +1021,11 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     const canvasStream = (canvas as any).captureStream(PROTOCOL_CONFIG.TARGET_FRAMERATE);
 
     if (stream) {
-      const audioTrack = stream.getAudioTracks()[0];
-      if (audioTrack) {
-        audioTrack.enabled = !isMutedRef.current;
-        canvasStream.addTrack(audioTrack);
+      // 应用高级音频处理
+      const processedAudioTrack = setupAudioProcessing(stream);
+      if (processedAudioTrack) {
+        processedAudioTrack.enabled = !isMutedRef.current;
+        canvasStream.addTrack(processedAudioTrack);
       }
     }
 
@@ -1072,27 +1223,34 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     video.muted = true;
     video.playsInline = true;
 
-    const render = () => {
+    const render = (timestamp: number) => {
       if (ctx && video.readyState >= 2 && rawStreamRef.current) {
-        if (video.videoWidth !== lastWidth || video.videoHeight !== lastHeight) {
-          canvas.width = lastWidth = video.videoWidth;
-          canvas.height = lastHeight = video.videoHeight;
-        }
+        // 自适应帧率控制
+        const frameInterval = 1000 / PROTOCOL_CONFIG.TARGET_FRAMERATE;
+        if (timestamp - renderPrevTimeRef.current >= frameInterval) {
+          renderPrevTimeRef.current = timestamp;
 
-        if (filterRef.current === PrivacyFilter.BLACK) {
-          ctx.fillStyle = '#06080a';
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-        } else if (filterRef.current === PrivacyFilter.MOSAIC) {
-          const scale = 0.02;
-          const w = Math.max(1, canvas.width * scale);
-          const h = Math.max(1, canvas.height * scale);
-          ctx.imageSmoothingEnabled = false;
-          ctx.drawImage(video, 0, 0, w, h);
-          ctx.filter = 'blur(10px)';
-          ctx.drawImage(canvas, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
-          ctx.filter = 'none';
-        } else {
-          ctx.drawImage(video, 0, 0);
+          if (video.videoWidth !== lastWidth || video.videoHeight !== lastHeight) {
+            canvas.width = lastWidth = video.videoWidth;
+            canvas.height = lastHeight = video.videoHeight;
+          }
+
+          if (filterRef.current === PrivacyFilter.BLACK) {
+            ctx.fillStyle = '#06080a';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+          } else if (filterRef.current === PrivacyFilter.MOSAIC) {
+            const scale = 0.02;
+            const w = Math.max(1, canvas.width * scale);
+            const h = Math.max(1, canvas.height * scale);
+            ctx.imageSmoothingEnabled = false;
+            ctx.drawImage(video, 0, 0, w, h);
+            ctx.filter = 'blur(10px)';
+            ctx.drawImage(canvas, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
+            ctx.filter = 'none';
+          } else {
+            // 正常模式：直接绘制，减少开销
+            ctx.drawImage(video, 0, 0);
+          }
         }
       }
       animationFrame = requestAnimationFrame(render);
@@ -1107,7 +1265,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       }
     }, 1000);
 
-    render();
+    render(performance.now());
 
     return () => {
       cancelAnimationFrame(animationFrame);
@@ -1341,6 +1499,38 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         >
           销毁会话
         </button>
+
+        {/* 网络质量监控 - 浮动显示 */}
+        {connectionStatus === 'connected' && (
+          <div className="absolute top-2 left-1/2 -translate-x-1/2 flex items-center gap-4 bg-black/40 backdrop-blur-md px-4 py-1.5 rounded-full border border-white/5 animate-in fade-in slide-in-from-top-2 duration-700">
+            <div className="flex items-center gap-2">
+              <span className={`size-1.5 rounded-full ${netStats.quality === 'excellent' ? 'bg-accent shadow-[0_0_8px_var(--color-accent)]' :
+                netStats.quality === 'good' ? 'bg-green-400' :
+                  netStats.quality === 'fair' ? 'bg-amber-400' : 'bg-red-500 animate-pulse'
+                }`}></span>
+              <span className="text-[9px] font-bold text-gray-400 uppercase tracking-wider">
+                {netStats.quality === 'excellent' ? '优秀' :
+                  netStats.quality === 'good' ? '良好' :
+                    netStats.quality === 'fair' ? '一般' : '较差'}
+              </span>
+            </div>
+            <div className="h-3 w-px bg-white/10"></div>
+            <div className="flex gap-4">
+              <div className="flex flex-col items-center">
+                <span className="text-[8px] text-gray-600 font-black uppercase tracking-tighter">码率</span>
+                <span className="text-[10px] text-white/70 font-mono">{netStats.bitrate}k</span>
+              </div>
+              <div className="flex flex-col items-center">
+                <span className="text-[8px] text-gray-600 font-black uppercase tracking-tighter">延迟</span>
+                <span className="text-[10px] text-white/70 font-mono">{netStats.rtt}ms</span>
+              </div>
+              <div className="flex flex-col items-center">
+                <span className="text-[8px] text-gray-600 font-black uppercase tracking-tighter">丢包</span>
+                <span className="text-[10px] text-white/70 font-mono">{netStats.packetLoss}%</span>
+              </div>
+            </div>
+          </div>
+        )}
       </header>
 
       <main className="flex-1 relative overflow-hidden bg-black">

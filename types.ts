@@ -71,3 +71,11 @@ export interface RoomConfig {
   defaultFilter: PrivacyFilter;
   initialOffer?: string;
 }
+export interface NetworkStats {
+  bitrate: number;      // 实时码率 (kbps)
+  framerate: number;    // 实时帧率
+  packetLoss: number;   // 丢包率 %
+  rtt: number;          // 往返延迟 ms
+  jitter: number;       // 抖动 ms
+  quality: 'excellent' | 'good' | 'fair' | 'poor';
+}
